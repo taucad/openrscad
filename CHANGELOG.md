@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.0-beta.2
+
+### Patch Changes
+
+- [#1](https://github.com/taucad/openrscad/pull/1) [`abbafb9`](https://github.com/taucad/openrscad/commit/abbafb96c207b6d76b02dbae4e16e7d2ff4c71c2) Thanks [@rifont](https://github.com/rifont)! - `--edges` now draws the real outline of hulled geometry. A `hull()` of two cylinders used to file each operand's flat caps and its curved wall under one surface, so the rim around a rounded stroke end went undrawn while straight chords cut across the caps and seams ran down the smooth side walls — a letter built from hulled cylinder pairs lost most of its top outline. Hull faces are now cut apart at their creases, and the boundary between two surfaces is judged per connected run rather than per surface pair, so a boundary that is smooth in one place and creased in another is drawn only where it creases. Two visible consequences: hulling a coarse-`$fn` primitive now shows the facet creases sharper than 30°, and a genuinely sharp corner that a chain of smooth neighbours used to suppress — a reflex corner of an `offset` or a glyph — is drawn again.
+
 ## 0.11.0-beta.1
 
 ### Minor Changes

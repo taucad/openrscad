@@ -7,6 +7,7 @@
   "changesets": [
     "cli-glb-feature-edges",
     "fix-wasm-facade-abi",
+    "hull-feature-edge-classification",
     "native-structured-3d-export"
   ]
 }

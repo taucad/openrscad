@@ -1,6 +1,6 @@
 {
   "name": "@taulabs/openrscad-engine",
-  "version": "0.11.0-beta.1",
+  "version": "0.11.0-beta.2",
   "description": "Tau's fork of the OpenRSCAD geometry engine, compiled to WebAssembly — parse .scad source and render solid 3D meshes in the browser or Node. Adds an authored-scene GLB/3MF export path with source-derived feature edges; tracks upstream.",
   "type": "module",
   "license": "Apache-2.0 OR MIT",

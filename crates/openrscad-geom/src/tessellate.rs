@@ -27,7 +27,7 @@ pub fn fragments(r: f64, f: FragmentSpec) -> u32 {
 /// A point on a circle of `n` fragments, `i`-th fragment, radius `r`.
 fn circle_point(r: f64, i: u32, n: u32) -> [f64; 2] {
     let phi = (2.0 * PI * i as f64) / n as f64;
-    [r * phi.cos(), r * phi.sin()]
+    [r * libm::cos(phi), r * libm::sin(phi)]
 }
 
 /// Build a mesh from explicit points and (possibly polygonal) faces.
@@ -371,8 +371,8 @@ pub fn sphere(r: f64, frags: FragmentSpec) -> Mesh {
     let mut verts: Vec<[f64; 3]> = Vec::with_capacity((num_rings * n) as usize);
     for i in 0..num_rings {
         let phi = (PI * (i as f64 + 0.5)) / num_rings as f64;
-        let ring_r = r * phi.sin();
-        let z = r * phi.cos();
+        let ring_r = r * libm::sin(phi);
+        let z = r * libm::cos(phi);
         for j in 0..n {
             let p = circle_point(ring_r, j, n);
             verts.push([p[0], p[1], z]);

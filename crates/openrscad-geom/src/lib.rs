@@ -1804,9 +1804,9 @@ fn rotate(m: &mut Mesh, deg: Vec3) {
         deg[1].to_radians(),
         deg[2].to_radians(),
     );
-    let (sa, ca) = (a.sin(), a.cos());
-    let (sb, cb) = (b.sin(), b.cos());
-    let (sc, cc) = (c.sin(), c.cos());
+    let (sa, ca) = (libm::sin(a), libm::cos(a));
+    let (sb, cb) = (libm::sin(b), libm::cos(b));
+    let (sc, cc) = (libm::sin(c), libm::cos(c));
     for p in &mut m.verts {
         let [x, y, z] = *p;
         // Rx

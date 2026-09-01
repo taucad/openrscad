@@ -1,71 +1,13 @@
-//! wasm-bindgen engine surface for the browser playground.
+//! wasm-bindgen marshalling for the browser and Node bundles.
 //!
-//! Exposes a single `render(source)` entry point that runs the full pipeline
-//! (parse → eval → geometry) and returns mesh data as typed arrays plus
-//! console output and diagnostics. Geometry uses the pure-Rust Manifold kernel
-//! (the default on wasm).
+//! Every entry point here converts JS-friendly parallel arrays into an
+//! [`openrscad_api::Request`], calls `openrscad-api`, and converts the result
+//! back into a `#[wasm_bindgen]` struct. **No pipeline logic lives in this
+//! crate** — it and the N-API addon in `openrscad-napi` are two marshalling
+//! layers over one implementation, which is the only way the two builds can be
+//! held to a byte-identical artifact contract.
 
-use std::cell::RefCell;
 use wasm_bindgen::prelude::*;
-#[cfg(feature = "benchmark-profile")]
-use web_time::Instant;
-
-thread_local! {
-    /// Persistent geometry cache across renders — makes warm edits incremental
-    /// (only subtrees whose structure changed are re-rendered). The worker is
-    /// single-threaded, so a thread-local is the whole story.
-    static CACHE: RefCell<openrscad_geom::GeomCache> = RefCell::new(openrscad_geom::GeomCache::new());
-    /// One complete attributed result, shared by GLB and 3MF serialization.
-    /// Serialized artifacts and request-only edge pairs are never retained.
-    static STRUCTURED_CACHE: RefCell<Option<(StructuredCacheKey, openrscad_geom::StructuredMesh, openrscad_geom::RenderDiagnostics)>> = const { RefCell::new(None) };
-    #[cfg(test)]
-    static STRUCTURED_RENDER_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    #[cfg(feature = "benchmark-profile")]
-    static LAST_BENCHMARK_PROFILE: RefCell<String> = const { RefCell::new(String::new()) };
-}
-
-#[cfg(all(feature = "benchmark-profile", target_arch = "wasm32"))]
-fn wasm_memory_bytes() -> u32 {
-    use wasm_bindgen::JsCast;
-    wasm_bindgen::memory()
-        .unchecked_into::<js_sys::WebAssembly::Memory>()
-        .buffer()
-        .unchecked_into::<js_sys::ArrayBuffer>()
-        .byte_length()
-}
-
-#[cfg(all(feature = "benchmark-profile", not(target_arch = "wasm32")))]
-fn wasm_memory_bytes() -> u32 {
-    0
-}
-
-#[cfg(feature = "benchmark-profile")]
-fn store_benchmark_profile(profile: serde_json::Value) {
-    LAST_BENCHMARK_PROFILE.with(|last| *last.borrow_mut() = profile.to_string());
-}
-
-/// Return and clear the last profile produced by a benchmark-feature build.
-#[cfg(feature = "benchmark-profile")]
-#[wasm_bindgen]
-pub fn take_last_benchmark_profile() -> String {
-    LAST_BENCHMARK_PROFILE.with(|last| std::mem::take(&mut *last.borrow_mut()))
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct StructuredCacheKey {
-    source: String,
-    names: Vec<String>,
-    values: Vec<String>,
-    file_names: Vec<String>,
-    file_contents: Vec<String>,
-    bin_names: Vec<String>,
-    bin_data: Vec<String>,
-    font_blobs: Vec<String>,
-    preview: bool,
-}
-
-/// Bound on cached subtrees; past this the cache is reset to cap memory.
-const CACHE_CAP: usize = 8192;
 
 /// Initialize panic hook for readable errors in the browser console.
 #[wasm_bindgen(start)]
@@ -73,17 +15,63 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
+/// Return and clear the last profile produced by a benchmark-feature build.
+#[cfg(feature = "benchmark-profile")]
+#[wasm_bindgen]
+pub fn take_last_benchmark_profile() -> String {
+    openrscad_api::take_last_benchmark_profile()
+}
+
 /// Drop the persistent geometry cache (e.g. when loading a new document).
 #[wasm_bindgen]
 pub fn clear_cache() {
-    CACHE.with(|c| c.borrow_mut().clear());
-    STRUCTURED_CACHE.with(|cache| *cache.borrow_mut() = None);
+    openrscad_api::clear_cache();
 }
 
 /// Engine version string.
 #[wasm_bindgen]
 pub fn version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
+    openrscad_api::version()
+}
+
+/// The customizer parameter schema for a source string, as a JSON string
+/// (`{"params":[…]}`). The playground renders a control panel from this.
+#[wasm_bindgen]
+pub fn parameters(source: &str) -> String {
+    openrscad_api::parameters(source)
+}
+
+/// Build a request from the parallel arrays the JS surface speaks.
+///
+/// `bin_data` and `font_blobs` are base64 because raw bytes cannot cross the
+/// string-typed wasm boundary; entries that fail to decode are dropped (the
+/// engine then warns "can't open" for that import, and `text()` falls back to
+/// Liberation). A native host passes `Buffer`s straight through instead.
+#[allow(clippy::too_many_arguments)]
+fn request(
+    source: &str,
+    names: Vec<String>,
+    values: Vec<String>,
+    file_names: Vec<String>,
+    file_contents: Vec<String>,
+    bin_names: Vec<String>,
+    bin_data: Vec<String>,
+    font_blobs: Vec<String>,
+) -> openrscad_api::Request {
+    openrscad_api::Request {
+        source: source.to_string(),
+        params: names.into_iter().zip(values).collect(),
+        files: file_names.into_iter().zip(file_contents).collect(),
+        binary_files: bin_names
+            .into_iter()
+            .zip(bin_data)
+            .filter_map(|(name, data)| base64_decode(&data).map(|bytes| (name, bytes)))
+            .collect(),
+        font_files: font_blobs
+            .iter()
+            .filter_map(|blob| base64_decode(blob))
+            .collect(),
+    }
 }
 
 /// The result of rendering a `.scad` source string.
@@ -250,6 +238,32 @@ impl RenderResult {
     }
 }
 
+impl From<openrscad_api::Render> for RenderResult {
+    fn from(value: openrscad_api::Render) -> Self {
+        Self {
+            positions: value.positions,
+            normals: value.normals,
+            echo: value.echo,
+            warnings: value.warnings,
+            error: value.error,
+            geom_errors: value.geom_errors,
+            diagnostics: value.diagnostics,
+            preview_positions: value.preview_positions,
+            preview_normals: value.preview_normals,
+            groups: value.groups,
+            provenance_positions: value.provenance_positions,
+            provenance_normals: value.provenance_normals,
+            provenance: value.provenance,
+            viewport: value.viewport,
+            triangle_count: value.triangle_count,
+            vertex_count: value.vertex_count,
+            volume: value.volume,
+            area: value.area,
+            is_2d: value.is_2d,
+        }
+    }
+}
+
 /// One owned native 3D artifact plus the operational metadata needed by hosts.
 #[wasm_bindgen]
 pub struct ExportShape3DResult {
@@ -343,33 +357,33 @@ impl ExportShape3DResult {
 
 impl ExportShape3DResult {
     fn from_error(format: &str, message: String, diagnostics: String) -> Self {
-        Self {
-            bytes: Vec::new(),
+        openrscad_api::Artifact3d {
             format: format.to_string(),
-            echo: String::new(),
-            warnings: String::new(),
             error: Some(message),
-            geom_errors: String::new(),
             diagnostics,
-            viewport: String::new(),
-            triangle_count: 0,
-            vertex_count: 0,
-            volume: 0.0,
-            area: 0.0,
-            is_2d: false,
+            ..openrscad_api::Artifact3d::default()
         }
+        .into()
     }
 }
 
-fn export_format(format: &str) -> Option<openrscad_geom::ExportFormat3D> {
-    match format {
-        "stl" => Some(openrscad_geom::ExportFormat3D::Stl),
-        "off" => Some(openrscad_geom::ExportFormat3D::Off),
-        "obj" => Some(openrscad_geom::ExportFormat3D::Obj),
-        "3mf" => Some(openrscad_geom::ExportFormat3D::ThreeMf),
-        "amf" => Some(openrscad_geom::ExportFormat3D::Amf),
-        "glb" => Some(openrscad_geom::ExportFormat3D::Glb),
-        _ => None,
+impl From<openrscad_api::Artifact3d> for ExportShape3DResult {
+    fn from(value: openrscad_api::Artifact3d) -> Self {
+        Self {
+            bytes: value.bytes,
+            format: value.format,
+            echo: value.echo,
+            warnings: value.warnings,
+            error: value.error,
+            geom_errors: value.geom_errors,
+            diagnostics: value.diagnostics,
+            viewport: value.viewport,
+            triangle_count: value.triangle_count,
+            vertex_count: value.vertex_count,
+            volume: value.volume,
+            area: value.area,
+            is_2d: value.is_2d,
+        }
     }
 }
 
@@ -390,7 +404,17 @@ pub fn export_3d(
     source_unit_to_meters: f64,
     coordinate_system: &str,
 ) -> ExportShape3DResult {
-    artifact_3d(
+    if names.len() != values.len()
+        || file_names.len() != file_contents.len()
+        || bin_names.len() != bin_data.len()
+    {
+        return ExportShape3DResult::from_error(
+            format,
+            "parallel request arrays have different lengths".to_string(),
+            "[]".to_string(),
+        );
+    }
+    let request = request(
         source,
         names,
         values,
@@ -399,12 +423,18 @@ pub fn export_3d(
         bin_names,
         bin_data,
         font_blobs,
-        format,
-        include_edges,
-        source_unit_to_meters,
-        coordinate_system,
-        false,
+    );
+    openrscad_api::artifact_3d(
+        &request,
+        &openrscad_api::ExportOptions {
+            format: format.to_string(),
+            include_edges,
+            source_unit_to_meters,
+            coordinate_system: coordinate_system.to_string(),
+            preview: false,
+        },
     )
+    .into()
 }
 
 /// Render a preview-semantics GLB for interactive viewers.
@@ -421,7 +451,17 @@ pub fn render_to_glb(
     font_blobs: Vec<String>,
     include_edges: bool,
 ) -> ExportShape3DResult {
-    artifact_3d(
+    if names.len() != values.len()
+        || file_names.len() != file_contents.len()
+        || bin_names.len() != bin_data.len()
+    {
+        return ExportShape3DResult::from_error(
+            "glb",
+            "parallel request arrays have different lengths".to_string(),
+            "[]".to_string(),
+        );
+    }
+    let request = request(
         source,
         names,
         values,
@@ -430,335 +470,17 @@ pub fn render_to_glb(
         bin_names,
         bin_data,
         font_blobs,
-        "glb",
-        include_edges,
-        0.001,
-        "y-up",
-        true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn artifact_3d(
-    source: &str,
-    names: Vec<String>,
-    values: Vec<String>,
-    file_names: Vec<String>,
-    file_contents: Vec<String>,
-    bin_names: Vec<String>,
-    bin_data: Vec<String>,
-    font_blobs: Vec<String>,
-    format: &str,
-    include_edges: bool,
-    source_unit_to_meters: f64,
-    coordinate_system: &str,
-    preview: bool,
-) -> ExportShape3DResult {
-    #[cfg(feature = "benchmark-profile")]
-    openrscad_geom::reset_benchmark_profile();
-    #[cfg(feature = "benchmark-profile")]
-    let profile_started = Instant::now();
-    #[cfg(feature = "benchmark-profile")]
-    let memory_before = wasm_memory_bytes();
-    let Some(export_format) = export_format(format) else {
-        return ExportShape3DResult::from_error(
-            format,
-            format!("unsupported 3D export format: {format}"),
-            "[]".to_string(),
-        );
-    };
-    if names.len() != values.len()
-        || file_names.len() != file_contents.len()
-        || bin_names.len() != bin_data.len()
-    {
-        return ExportShape3DResult::from_error(
-            format,
-            "parallel request arrays have different lengths".to_string(),
-            "[]".to_string(),
-        );
-    }
-    let coordinate_system = match coordinate_system {
-        "y-up" => openrscad_geom::CoordinateSystem::YUp,
-        "z-up" => openrscad_geom::CoordinateSystem::ZUp,
-        _ => {
-            return ExportShape3DResult::from_error(
-                format,
-                format!("unsupported coordinate system: {coordinate_system}"),
-                "[]".to_string(),
-            );
-        }
-    };
-    let structured_key = StructuredCacheKey {
-        source: source.to_string(),
-        names: names.clone(),
-        values: values.clone(),
-        file_names: file_names.clone(),
-        file_contents: file_contents.clone(),
-        bin_names: bin_names.clone(),
-        bin_data: bin_data.clone(),
-        font_blobs: font_blobs.clone(),
-        preview,
-    };
-    register_font_blobs(font_blobs);
-    #[cfg(feature = "benchmark-profile")]
-    let parse_started = Instant::now();
-    let program = match openrscad_syntax::parse(source) {
-        Ok(program) => program,
-        Err(error) => {
-            let message = format!("parse error: {}", error.message);
-            let diagnostic = openrscad_eval::parse_error_diagnostic(message.clone(), error.span);
-            return ExportShape3DResult::from_error(
-                format,
-                message,
-                openrscad_eval::diagnostics_json(Some(&diagnostic), &[]),
-            );
-        }
-    };
-    #[cfg(feature = "benchmark-profile")]
-    let parse_ms = parse_started.elapsed().as_secs_f64() * 1_000.0;
-    let overrides = names
-        .iter()
-        .zip(values.iter())
-        .filter_map(|(name, value)| {
-            openrscad_syntax::customizer::parse_value(value)
-                .map(|value| (name.clone(), openrscad_eval::value_from_param(&value)))
-        })
-        .collect::<Vec<_>>();
-    let resolver = MapResolver {
-        files: file_names.into_iter().zip(file_contents).collect(),
-        bins: bins_from_b64(bin_names, bin_data),
-    };
-    #[cfg(feature = "benchmark-profile")]
-    let evaluate_started = Instant::now();
-    let structured_format = matches!(
-        export_format,
-        openrscad_geom::ExportFormat3D::Glb | openrscad_geom::ExportFormat3D::ThreeMf
     );
-    let eval = match if preview {
-        openrscad_eval::eval_program_with_params_detailed(&program, &resolver, ".", &overrides)
-    } else if structured_format {
-        openrscad_eval::eval_program_with_params_detailed_export(
-            &program, &resolver, ".", &overrides,
-        )
-    } else {
-        openrscad_eval::eval_program_with_params_export(&program, &resolver, ".", &overrides)
-    } {
-        Ok(output) => output,
-        Err(error) => {
-            let diagnostic = openrscad_eval::eval_error_diagnostic(&error);
-            return ExportShape3DResult::from_error(
-                format,
-                format!("evaluation error: {}", error.message),
-                openrscad_eval::diagnostics_json(Some(&diagnostic), &[]),
-            );
-        }
-    };
-    #[cfg(feature = "benchmark-profile")]
-    let evaluate_ms = evaluate_started.elapsed().as_secs_f64() * 1_000.0;
-    let diagnostics = openrscad_eval::diagnostics_json(None, &eval.warnings);
-    let mut warnings = eval
-        .warnings
-        .iter()
-        .map(|warning| warning.message.clone())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let echo = eval.echoes.join("\n");
-    let viewport = if source.contains("$vp") {
-        openrscad_eval::viewport_json(&eval.viewport)
-    } else {
-        String::new()
-    };
-    let is_2d = openrscad_geom::is_2d(&eval.node);
-    if is_2d {
-        let mut result = ExportShape3DResult::from_error(
-            format,
-            "3D export requested for a 2D model".to_string(),
-            diagnostics,
-        );
-        result.echo = echo;
-        result.warnings = warnings;
-        result.viewport = viewport;
-        result.is_2d = true;
-        return result;
-    }
-
-    let options = openrscad_geom::Export3DOptions {
-        include_edges,
-        source_unit_to_meters,
-        coordinate_system,
-        source_keys: eval.source_keys,
-    };
-    let kernel = openrscad_geom::RustManifoldKernel::new();
-    #[cfg(feature = "benchmark-profile")]
-    let structured_started = Instant::now();
-    #[cfg(feature = "benchmark-profile")]
-    let mut structured_cache_hit = false;
-    #[cfg(feature = "benchmark-profile")]
-    let mut serialization_ms = 0.0;
-    let artifact = match export_format {
-        openrscad_geom::ExportFormat3D::Glb | openrscad_geom::ExportFormat3D::ThreeMf => {
-            STRUCTURED_CACHE.with(|structured_cache| {
-                let mut structured_cache = structured_cache.borrow_mut();
-                if structured_cache
-                    .as_ref()
-                    .is_none_or(|(key, _, _)| key != &structured_key)
-                {
-                    let (structured, geometry_diagnostics) = CACHE.with(|cache| {
-                        let mut cache = cache.borrow_mut();
-                        if cache.len() > CACHE_CAP {
-                            cache.clear();
-                        }
-                        openrscad_geom::render_structured_cached_diag(
-                            &eval.node, &kernel, &mut cache, preview,
-                        )
-                    })?;
-                    #[cfg(test)]
-                    STRUCTURED_RENDER_COUNT.with(|count| count.set(count.get() + 1));
-                    *structured_cache = Some((structured_key, structured, geometry_diagnostics));
-                } else {
-                    #[cfg(feature = "benchmark-profile")]
-                    {
-                        structured_cache_hit = true;
-                    }
-                }
-                let structured = &structured_cache.as_ref().unwrap().1;
-                let geometry_diagnostics = structured_cache.as_ref().unwrap().2.clone();
-                #[cfg(feature = "benchmark-profile")]
-                let serialization_started = Instant::now();
-                let result = openrscad_geom::export_3d(structured, export_format, &options);
-                #[cfg(feature = "benchmark-profile")]
-                {
-                    serialization_ms = serialization_started.elapsed().as_secs_f64() * 1_000.0;
-                }
-                Ok((result, geometry_diagnostics))
-            })
-        }
-        _ => CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if cache.len() > CACHE_CAP {
-                cache.clear();
-            }
-            let (mesh, geometry_diagnostics) =
-                openrscad_geom::render_cached_diag(&eval.node, &kernel, &mut cache)?;
-            #[cfg(feature = "benchmark-profile")]
-            let serialization_started = Instant::now();
-            let bytes = match export_format {
-                openrscad_geom::ExportFormat3D::Stl => mesh.to_binary_stl(),
-                openrscad_geom::ExportFormat3D::Off => mesh.to_off().into_bytes(),
-                openrscad_geom::ExportFormat3D::Obj => mesh.to_obj().into_bytes(),
-                openrscad_geom::ExportFormat3D::Amf => mesh.to_amf().into_bytes(),
-                _ => unreachable!("structured formats are handled above"),
-            };
-            let result = Ok(openrscad_geom::Export3DArtifact {
-                bytes,
-                triangle_count: mesh.tris.len(),
-                vertex_count: mesh.verts.len(),
-                volume: mesh.volume(),
-                surface_area: mesh.surface_area(),
-            });
-            #[cfg(feature = "benchmark-profile")]
-            {
-                serialization_ms = serialization_started.elapsed().as_secs_f64() * 1_000.0;
-            }
-            Ok((result, geometry_diagnostics))
-        }),
-    };
-    let (artifact, geometry_diagnostics) =
-        artifact.unwrap_or_else(|error| (Err(error), openrscad_geom::RenderDiagnostics::default()));
-    #[cfg(feature = "benchmark-profile")]
-    {
-        let geom = openrscad_geom::take_benchmark_profile();
-        let payload_bytes = artifact.as_ref().map_or(0, |artifact| artifact.bytes.len());
-        let cache_entries = CACHE.with(|cache| cache.borrow().len());
-        store_benchmark_profile(serde_json::json!({
-            "path": if preview { "renderToGlb" } else { "exportShape3D" },
-            "format": format,
-            "includeEdges": include_edges,
-            "parseMs": parse_ms,
-            "evaluateMs": evaluate_ms,
-            "structuredTotalMs": structured_started.elapsed().as_secs_f64() * 1_000.0,
-            "structuredGeometryMs":
-                (structured_started.elapsed().as_secs_f64() * 1_000.0 - serialization_ms).max(0.0),
-            "attributedRenderMs": geom.attributed_render_ms,
-            "booleanMs": geom.boolean_ms,
-            "attributedTopologyMs": (geom.attributed_render_ms - geom.boolean_ms).max(0.0),
-            "partitionMs": geom.partition_ms,
-            "edgeDerivationMs": geom.edge_derivation_ms,
-            "serializationMs": serialization_ms,
-            "rustTotalMs": profile_started.elapsed().as_secs_f64() * 1_000.0,
-            "featureLineCount": geom.feature_line_count,
-            "payloadBytes": payload_bytes,
-            "structuredCacheHit": structured_cache_hit,
-            "geometryCacheEntries": cache_entries,
-            "wasmMemoryBeforeBytes": memory_before,
-            "wasmMemoryAfterBytes": wasm_memory_bytes(),
-        }));
-    }
-    for warning in &geometry_diagnostics.warnings {
-        if !warnings.is_empty() {
-            warnings.push('\n');
-        }
-        warnings.push_str(warning);
-    }
-    let geom_errors = geometry_diagnostics.errors.join("\n");
-    match artifact {
-        Ok(artifact) => ExportShape3DResult {
-            bytes: artifact.bytes,
-            format: format.to_string(),
-            echo,
-            warnings,
-            error: None,
-            geom_errors,
-            diagnostics,
-            viewport,
-            triangle_count: artifact.triangle_count as u32,
-            vertex_count: artifact.vertex_count as u32,
-            volume: artifact.volume,
-            area: artifact.surface_area,
-            is_2d: false,
+    openrscad_api::artifact_3d(
+        &request,
+        &openrscad_api::ExportOptions {
+            format: "glb".to_string(),
+            include_edges,
+            preview: true,
+            ..openrscad_api::ExportOptions::default()
         },
-        Err(error) => {
-            let diagnostic = openrscad_eval::eval_error_diagnostic(
-                &openrscad_eval::EvalError::new(format!("geometry error: {error}")),
-            );
-            let mut result = ExportShape3DResult::from_error(
-                format,
-                format!("geometry error: {error}"),
-                openrscad_eval::diagnostics_json(Some(&diagnostic), &eval.warnings),
-            );
-            result.echo = echo;
-            result.warnings = warnings;
-            result.geom_errors = geom_errors;
-            result.viewport = viewport;
-            result
-        }
-    }
-}
-
-impl RenderResult {
-    fn from_error(msg: String, echo: String, warnings: String, diagnostics: String) -> Self {
-        RenderResult {
-            positions: Vec::new(),
-            normals: Vec::new(),
-            echo,
-            warnings,
-            error: Some(msg),
-            geom_errors: String::new(),
-            diagnostics,
-            preview_positions: Vec::new(),
-            preview_normals: Vec::new(),
-            groups: String::new(),
-            provenance_positions: Vec::new(),
-            provenance_normals: Vec::new(),
-            provenance: String::new(),
-            viewport: String::new(),
-            triangle_count: 0,
-            vertex_count: 0,
-            volume: 0.0,
-            area: 0.0,
-            is_2d: false,
-        }
-    }
+    )
+    .into()
 }
 
 /// Render a 2D model and serialize it to DXF or SVG text. Returns an empty
@@ -777,38 +499,17 @@ pub fn export_2d(
     font_blobs: Vec<String>,
     format: &str,
 ) -> String {
-    register_font_blobs(font_blobs);
-    let Ok(program) = openrscad_syntax::parse(source) else {
-        return String::new();
-    };
-    let mut overrides = Vec::new();
-    for (name, val) in names.iter().zip(values.iter()) {
-        if let Some(pv) = openrscad_syntax::customizer::parse_value(val) {
-            overrides.push((name.clone(), openrscad_eval::value_from_param(&pv)));
-        }
-    }
-    let resolver = MapResolver {
-        files: file_names.into_iter().zip(file_contents).collect(),
-        bins: bins_from_b64(bin_names, bin_data),
-    };
-    let Ok(eval) =
-        openrscad_eval::eval_program_with_params_export(&program, &resolver, ".", &overrides)
-    else {
-        return String::new();
-    };
-    let kernel = openrscad_geom::RustManifoldKernel::new();
-    match openrscad_geom::render_contours_with(&eval.node, &kernel) {
-        Ok(Some(contours)) if format == "dxf" => openrscad_geom::export_dxf(&contours),
-        Ok(Some(contours)) if format == "svg" => openrscad_geom::export_svg(&contours),
-        _ => String::new(),
-    }
-}
-
-/// The customizer parameter schema for a source string, as a JSON string
-/// (`{"params":[…]}`). The playground renders a control panel from this.
-#[wasm_bindgen]
-pub fn parameters(source: &str) -> String {
-    openrscad_syntax::customizer::extract(source).to_json()
+    let request = request(
+        source,
+        names,
+        values,
+        file_names,
+        file_contents,
+        bin_names,
+        bin_data,
+        font_blobs,
+    );
+    openrscad_api::export_2d(&request, format)
 }
 
 /// Run the full pipeline on a source string.
@@ -834,87 +535,62 @@ pub fn render_with_params(source: &str, names: Vec<String>, values: Vec<String>)
     )
 }
 
-/// A `FileResolver` over in-memory maps for the browser: `path -> source` for
-/// `include`/`use` (and text `import()` of DXF/SVG), plus `path -> bytes` for
-/// `import()` of binary assets (binary STL, 3MF) dropped into the playground.
-struct MapResolver {
-    files: std::collections::HashMap<String, String>,
-    bins: std::collections::HashMap<String, Vec<u8>>,
-}
-
-impl MapResolver {
-    /// Resolve a path against a map's keys: as written, then normalized against
-    /// the including dir. Shared by the source and binary maps.
-    fn resolve_in<T>(
-        map: &std::collections::HashMap<String, T>,
-        path: &str,
-        from_dir: &str,
-    ) -> Option<String> {
-        if map.contains_key(path) {
-            return Some(path.to_string());
-        }
-        let joined = if from_dir.is_empty() || from_dir == "." {
-            path.to_string()
-        } else {
-            format!("{from_dir}/{path}")
-        };
-        map.contains_key(&joined).then_some(joined)
-    }
-}
-
-impl openrscad_eval::FileResolver for MapResolver {
-    fn load(&self, path: &str, from_dir: &str) -> Option<openrscad_eval::LoadedFile> {
-        let key = Self::resolve_in(&self.files, path, from_dir)?;
-        let source = self.files.get(&key)?.clone();
-        let dir = key
-            .rsplit_once('/')
-            .map(|(d, _)| d.to_string())
-            .unwrap_or_default();
-        Some(openrscad_eval::LoadedFile {
-            key: key.clone(),
-            source,
-            dir,
-        })
-    }
-
-    /// Bytes for `import()`. Binary assets (STL/3MF) carried in the `bins` map
-    /// win; otherwise fall back to a text tab's bytes (a DXF/SVG profile).
-    fn load_bytes(&self, path: &str, from_dir: &str) -> Option<Vec<u8>> {
-        if let Some(key) = Self::resolve_in(&self.bins, path, from_dir) {
-            return self.bins.get(&key).cloned();
-        }
-        let key = Self::resolve_in(&self.files, path, from_dir)?;
-        self.files.get(&key).map(|s| s.clone().into_bytes())
-    }
-}
-
-/// Register fonts supplied by the browser (Local Font Access API blobs) into the
-/// engine's shared font database so `text(font="…")` can use system fonts. Each
-/// entry is one font file (`.ttf`/`.otf`/`.ttc`) base64-encoded — raw bytes
-/// can't cross the string-typed wasm boundary. Identical files are deduped
-/// engine-side, so re-sending a model's fonts every render is cheap. Entries
-/// that fail to decode are skipped (the font then falls back to Liberation).
-fn register_font_blobs(font_blobs: Vec<String>) {
-    for b64 in &font_blobs {
-        if let Some(bytes) = base64_decode(b64) {
-            openrscad_eval::register_font_data(bytes);
-        }
-    }
-}
-
-/// Build the binary-asset map from parallel arrays of names and base64-encoded
-/// bytes. Binary files can't survive the JS→wasm string boundary as raw bytes,
-/// so the browser base64-encodes them; entries that fail to decode are dropped
-/// (the engine then warns "can't open" for that import).
-fn bins_from_b64(
+/// Like [`render_with_params`], but `include`/`use` resolve against an in-memory
+/// set of files (`file_names[i]` → `file_contents[i]`) — the playground's other
+/// files and/or a bundled library.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_files(
+    source: &str,
     names: Vec<String>,
-    b64: Vec<String>,
-) -> std::collections::HashMap<String, Vec<u8>> {
-    names
-        .into_iter()
-        .zip(b64)
-        .filter_map(|(name, data)| base64_decode(&data).map(|bytes| (name, bytes)))
-        .collect()
+    values: Vec<String>,
+    file_names: Vec<String>,
+    file_contents: Vec<String>,
+    bin_names: Vec<String>,
+    bin_data: Vec<String>,
+    font_blobs: Vec<String>,
+) -> RenderResult {
+    let request = request(
+        source,
+        names,
+        values,
+        file_names,
+        file_contents,
+        bin_names,
+        bin_data,
+        font_blobs,
+    );
+    openrscad_api::render(&request, false).into()
+}
+
+/// Like [`render_with_files`], but renders the fast, **non-watertight** preview
+/// (see `openrscad_geom::render_preview_cached_diag`): unions are concatenated rather
+/// than run through the CSG kernel. Suitable for opaque on-screen display only —
+/// stats and export still use the exact path. Differences/intersections/hulls
+/// still resolve exactly, so holes and clips look correct.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn render_preview_with_files(
+    source: &str,
+    names: Vec<String>,
+    values: Vec<String>,
+    file_names: Vec<String>,
+    file_contents: Vec<String>,
+    bin_names: Vec<String>,
+    bin_data: Vec<String>,
+    font_blobs: Vec<String>,
+) -> RenderResult {
+    let request = request(
+        source,
+        names,
+        values,
+        file_names,
+        file_contents,
+        bin_names,
+        bin_data,
+        font_blobs,
+    );
+    openrscad_api::render(&request, true).into()
 }
 
 /// Decode standard base64 (RFC 4648, with `=` padding), ignoring ASCII
@@ -970,295 +646,6 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         return None; // truncated group
     }
     Some(out)
-}
-
-/// Like [`render_with_params`], but `include`/`use` resolve against an in-memory
-/// set of files (`file_names[i]` → `file_contents[i]`) — the playground's other
-/// files and/or a bundled library.
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn render_with_files(
-    source: &str,
-    names: Vec<String>,
-    values: Vec<String>,
-    file_names: Vec<String>,
-    file_contents: Vec<String>,
-    bin_names: Vec<String>,
-    bin_data: Vec<String>,
-    font_blobs: Vec<String>,
-) -> RenderResult {
-    render_impl(
-        source,
-        names,
-        values,
-        file_names,
-        file_contents,
-        bin_names,
-        bin_data,
-        font_blobs,
-        false,
-    )
-}
-
-/// Like [`render_with_files`], but renders the fast, **non-watertight** preview
-/// (see `openrscad_geom::render_preview_cached_diag`): unions are concatenated rather
-/// than run through the CSG kernel. Suitable for opaque on-screen display only —
-/// stats and export still use the exact path. Differences/intersections/hulls
-/// still resolve exactly, so holes and clips look correct.
-#[wasm_bindgen]
-#[allow(clippy::too_many_arguments)]
-pub fn render_preview_with_files(
-    source: &str,
-    names: Vec<String>,
-    values: Vec<String>,
-    file_names: Vec<String>,
-    file_contents: Vec<String>,
-    bin_names: Vec<String>,
-    bin_data: Vec<String>,
-    font_blobs: Vec<String>,
-) -> RenderResult {
-    render_impl(
-        source,
-        names,
-        values,
-        file_names,
-        file_contents,
-        bin_names,
-        bin_data,
-        font_blobs,
-        true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn render_impl(
-    source: &str,
-    names: Vec<String>,
-    values: Vec<String>,
-    file_names: Vec<String>,
-    file_contents: Vec<String>,
-    bin_names: Vec<String>,
-    bin_data: Vec<String>,
-    font_blobs: Vec<String>,
-    preview: bool,
-) -> RenderResult {
-    #[cfg(feature = "benchmark-profile")]
-    openrscad_geom::reset_benchmark_profile();
-    #[cfg(feature = "benchmark-profile")]
-    let profile_started = Instant::now();
-    #[cfg(feature = "benchmark-profile")]
-    let memory_before = wasm_memory_bytes();
-    // Register any browser-supplied system fonts before evaluating `text()`.
-    register_font_blobs(font_blobs);
-
-    // Parse.
-    #[cfg(feature = "benchmark-profile")]
-    let parse_started = Instant::now();
-    let program = match openrscad_syntax::parse(source) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("parse error: {}", e.message);
-            let diag = openrscad_eval::parse_error_diagnostic(msg.clone(), e.span);
-            return RenderResult::from_error(
-                msg,
-                String::new(),
-                String::new(),
-                openrscad_eval::diagnostics_json(Some(&diag), &[]),
-            );
-        }
-    };
-    #[cfg(feature = "benchmark-profile")]
-    let parse_ms = parse_started.elapsed().as_secs_f64() * 1_000.0;
-
-    // Build overrides from the parallel arrays.
-    let mut overrides = Vec::new();
-    for (name, val) in names.iter().zip(values.iter()) {
-        if let Some(pv) = openrscad_syntax::customizer::parse_value(val) {
-            overrides.push((name.clone(), openrscad_eval::value_from_param(&pv)));
-        }
-    }
-
-    // Build the in-memory file resolver from the parallel arrays.
-    let resolver = MapResolver {
-        files: file_names.into_iter().zip(file_contents).collect(),
-        bins: bins_from_b64(bin_names, bin_data),
-    };
-
-    // Evaluate.
-    #[cfg(feature = "benchmark-profile")]
-    let evaluate_started = Instant::now();
-    let eval = match openrscad_eval::eval_program_with_params(&program, &resolver, ".", &overrides)
-    {
-        Ok(o) => o,
-        Err(e) => {
-            let diag = openrscad_eval::eval_error_diagnostic(&e);
-            return RenderResult::from_error(
-                format!("evaluation error: {}", e.message),
-                String::new(),
-                String::new(),
-                openrscad_eval::diagnostics_json(Some(&diag), &[]),
-            );
-        }
-    };
-    #[cfg(feature = "benchmark-profile")]
-    let evaluate_ms = evaluate_started.elapsed().as_secs_f64() * 1_000.0;
-    let echo = eval.echoes.join("\n");
-    let mut warnings = eval
-        .warnings
-        .iter()
-        .map(|w| w.message.clone())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let diagnostics = openrscad_eval::diagnostics_json(None, &eval.warnings);
-
-    // Render geometry (pure-Rust Manifold on wasm), reusing the persistent cache
-    // so unchanged subtrees survive across edits.
-    let kernel = openrscad_geom::RustManifoldKernel::new();
-    #[cfg(feature = "benchmark-profile")]
-    let exact_render_started = Instant::now();
-    let mesh = CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() > CACHE_CAP {
-            cache.clear();
-        }
-        if preview {
-            // Fast path: skip the union kernel; result is not watertight.
-            openrscad_geom::render_preview_cached_diag(&eval.node, &kernel, &mut cache)
-        } else {
-            openrscad_geom::render_cached_diag(&eval.node, &kernel, &mut cache)
-        }
-    });
-    #[cfg(feature = "benchmark-profile")]
-    let exact_render_ms = exact_render_started.elapsed().as_secs_f64() * 1_000.0;
-    let (mesh, diag) = match mesh {
-        Ok(v) => v,
-        Err(e) => {
-            let ge = openrscad_eval::EvalError::new(format!("geometry error: {e}"));
-            let diag = openrscad_eval::eval_error_diagnostic(&ge);
-            return RenderResult::from_error(
-                format!("geometry error: {e}"),
-                echo,
-                warnings,
-                openrscad_eval::diagnostics_json(Some(&diag), &eval.warnings),
-            );
-        }
-    };
-    // Fold non-fatal geometry warnings (e.g. non-convex minkowski) into the
-    // console warnings stream.
-    for w in diag.warnings {
-        if !warnings.is_empty() {
-            warnings.push('\n');
-        }
-        warnings.push_str(&w);
-    }
-    // Recoverable geometry errors (a CSG op failed and the mesh is a fallback)
-    // go on their own channel so the UI can raise a distinct, non-blocking alert
-    // while still showing the degraded model.
-    let geom_errors = diag.errors.join("\n");
-
-    #[cfg(feature = "benchmark-profile")]
-    let mesh_encoding_started = Instant::now();
-    let (positions, normals) = mesh.to_triangle_soup_f32();
-    #[cfg(feature = "benchmark-profile")]
-    let mesh_encoding_ms = mesh_encoding_started.elapsed().as_secs_f64() * 1_000.0;
-
-    // Preview color channel — only for models that actually use color/`#`/`%`, so
-    // plain models keep the fast single-mesh path (and the warm-edit budget).
-    #[cfg(feature = "benchmark-profile")]
-    let preview_channel_started = Instant::now();
-    let (preview_positions, preview_normals, groups) =
-        if openrscad_geom::has_display_attrs(&eval.node) {
-            let r = CACHE.with(|c| {
-                let mut cache = c.borrow_mut();
-                openrscad_geom::render_groups_cached(&eval.node, &kernel, &mut cache)
-            });
-            match r {
-                Ok(groups) => openrscad_geom::preview_channel(&groups),
-                Err(_) => (Vec::new(), Vec::new(), String::new()),
-            }
-        } else {
-            (Vec::new(), Vec::new(), String::new())
-        };
-    #[cfg(feature = "benchmark-profile")]
-    let preview_channel_ms = preview_channel_started.elapsed().as_secs_f64() * 1_000.0;
-
-    // Provenance channel for editor↔preview linking — any model with geometry
-    // (2D flat meshes and 3D solids alike). Shares the cache with the fused
-    // render above, so opaque leaf meshes aren't recomputed just to tag them
-    // with a span.
-    #[cfg(feature = "benchmark-profile")]
-    let provenance_channel_started = Instant::now();
-    let (provenance_positions, provenance_normals, provenance) = if !mesh.tris.is_empty() {
-        let r = CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            openrscad_geom::render_provenance_cached(&eval.node, &kernel, &mut cache)
-        });
-        match r {
-            Ok(groups) => openrscad_geom::provenance_channel(&groups),
-            Err(_) => (Vec::new(), Vec::new(), String::new()),
-        }
-    } else {
-        (Vec::new(), Vec::new(), String::new())
-    };
-    #[cfg(feature = "benchmark-profile")]
-    let provenance_channel_ms = provenance_channel_started.elapsed().as_secs_f64() * 1_000.0;
-
-    // Viewport channel only for models that reference `$vp` (drives the camera).
-    let viewport = if source.contains("$vp") {
-        openrscad_eval::viewport_json(&eval.viewport)
-    } else {
-        String::new()
-    };
-
-    #[cfg(feature = "benchmark-profile")]
-    {
-        let payload_bytes = (positions.len()
-            + normals.len()
-            + preview_positions.len()
-            + preview_normals.len()
-            + provenance_positions.len()
-            + provenance_normals.len())
-            * std::mem::size_of::<f32>()
-            + groups.len()
-            + provenance.len();
-        let cache_entries = CACHE.with(|cache| cache.borrow().len());
-        store_benchmark_profile(serde_json::json!({
-            "path": "render",
-            "parseMs": parse_ms,
-            "evaluateMs": evaluate_ms,
-            "exactRenderMs": exact_render_ms,
-            "previewChannelMs": preview_channel_ms,
-            "provenanceChannelMs": provenance_channel_ms,
-            "meshEncodingMs": mesh_encoding_ms,
-            "rustTotalMs": profile_started.elapsed().as_secs_f64() * 1_000.0,
-            "payloadBytes": payload_bytes,
-            "geometryCacheEntries": cache_entries,
-            "wasmMemoryBeforeBytes": memory_before,
-            "wasmMemoryAfterBytes": wasm_memory_bytes(),
-        }));
-    }
-
-    RenderResult {
-        triangle_count: mesh.tris.len() as u32,
-        vertex_count: mesh.verts.len() as u32,
-        volume: mesh.volume(),
-        area: mesh.surface_area(),
-        is_2d: openrscad_geom::is_2d(&eval.node),
-        positions,
-        normals,
-        echo,
-        warnings,
-        error: None,
-        geom_errors,
-        diagnostics,
-        preview_positions,
-        preview_normals,
-        groups,
-        provenance_positions,
-        provenance_normals,
-        provenance,
-        viewport,
-    }
 }
 
 #[cfg(test)]
@@ -1393,19 +780,19 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     fn structured_cache_reuses_geometry_not_serialized_artifacts() {
         clear_cache();
-        STRUCTURED_RENDER_COUNT.with(|count| count.set(0));
+        openrscad_api::reset_structured_render_count();
         let mut plain = export("cube(1);", "glb", false);
         let plain_bytes = plain.take_bytes();
         let mut edged = export("cube(1);", "glb", true);
         let edged_bytes = edged.take_bytes();
         let mut threemf = export("cube(1);", "3mf", false);
         assert!(!threemf.take_bytes().is_empty());
-        STRUCTURED_RENDER_COUNT.with(|count| assert_eq!(count.get(), 1));
+        assert_eq!(openrscad_api::structured_render_count(), 1);
         assert_ne!(plain_bytes, edged_bytes);
 
         clear_cache();
         let _ = export("cube(1);", "glb", false);
-        STRUCTURED_RENDER_COUNT.with(|count| assert_eq!(count.get(), 2));
+        assert_eq!(openrscad_api::structured_render_count(), 2);
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), test)]

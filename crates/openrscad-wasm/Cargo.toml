@@ -7,28 +7,20 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-benchmark-profile = [
-  "dep:js-sys",
-  "dep:serde_json",
-  "dep:web-time",
-  "openrscad-geom/benchmark-profile",
-]
+benchmark-profile = ["openrscad-api/benchmark-profile"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-openrscad-syntax = { workspace = true }
-openrscad-eval = { workspace = true }
-openrscad-geom = { workspace = true }
-openrscad-ir = { workspace = true }
+openrscad-api = { workspace = true }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
-js-sys = { version = "0.3", optional = true }
-serde_json = { version = "1", optional = true }
-web-time = { version = "1", optional = true }
 
 [dev-dependencies]
+# Test-only: the suite asserts on geometry primitives directly.
+openrscad-geom = { workspace = true }
+openrscad-syntax = { workspace = true }
 serde_json = "1"
 # Runs the crate's tests in a real browser via `wasm-pack test`, exercising the
 # boolmesh-on-wasm kernel path that browsers actually execute.

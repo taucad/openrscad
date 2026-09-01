@@ -6,10 +6,19 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Filesystem + fontconfig font discovery, for hosts that call
+# `register_system_fonts()` (the CLI, the LSP, the desktop app). Off by default:
+# a host that finds OS fonts a browser cannot changes `text()` geometry, so the
+# native/wasm byte-parity lane must not carry it — and without it the addon
+# drops `memmap2` and `fontconfig` entirely.
+system-fonts = ["fontdb/fs", "fontdb/memmap", "fontdb/fontconfig"]
+
 [dependencies]
 openrscad-syntax = { workspace = true }
 openrscad-ir = { workspace = true }
 thiserror = { workspace = true }
+libm = { workspace = true }
 rustc-hash = { workspace = true }
 ttf-parser = { workspace = true }
 png = { workspace = true }
@@ -17,13 +26,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Font database: bundled Liberation is always loaded (deterministic default);
 # hosts may additionally register OS fonts (native) or font bytes (browser).
-# wasm gets no filesystem features; native enables mmap + fontconfig below.
+# Filesystem discovery is behind the `system-fonts` feature (off by default).
 fontdb = { version = "0.24", default-features = false, features = ["std"] }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-fontdb = { version = "0.24", default-features = false, features = [
-    "std",
-    "fs",
-    "memmap",
-    "fontconfig",
-] }

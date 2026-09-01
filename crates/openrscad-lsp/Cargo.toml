@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 openrscad-syntax = { workspace = true }
-openrscad-eval = { workspace = true }
+openrscad-eval = { workspace = true, features = ["system-fonts"] }
 openrscad-geom = { workspace = true }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["rt-multi-thread", "io-std", "macros", "time"] }

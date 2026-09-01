@@ -231,7 +231,7 @@ pub fn render2d(node: &Node) -> Vec<Contour> {
         Node::Scale { v, child } => map_contours(render2d(child), |p| [p[0] * v[0], p[1] * v[1]]),
         Node::Rotate { deg, child } => {
             let a = deg[2].to_radians();
-            let (s, c) = (a.sin(), a.cos());
+            let (s, c) = (libm::sin(a), libm::cos(a));
             map_contours(render2d(child), |p| {
                 [p[0] * c - p[1] * s, p[0] * s + p[1] * c]
             })
@@ -423,7 +423,7 @@ fn circle_contour(r: f64, frags: FragmentSpec) -> Contour {
     (0..n)
         .map(|i| {
             let a = 2.0 * PI * i as f64 / n as f64;
-            [r * a.cos(), r * a.sin()]
+            [r * libm::cos(a), r * libm::sin(a)]
         })
         .collect()
 }
@@ -633,8 +633,8 @@ fn offset_pieces(
         }
 
         if rounded {
-            let a0 = n_in[1].atan2(n_in[0]);
-            let a1 = n_out[1].atan2(n_out[0]);
+            let a0 = libm::atan2(n_in[1], n_in[0]);
+            let a1 = libm::atan2(n_out[1], n_out[0]);
             let mut da = a1 - a0;
             while da <= -PI {
                 da += 2.0 * PI;
@@ -646,7 +646,7 @@ fn offset_pieces(
             let mut cap = vec![vi];
             for s in 0..=steps {
                 let a = a0 + da * (s as f64 / steps as f64);
-                cap.push([vi[0] + amt * a.cos(), vi[1] + amt * a.sin()]);
+                cap.push([vi[0] + amt * libm::cos(a), vi[1] + amt * libm::sin(a)]);
             }
             out.push(cap);
         } else if chamfer {
@@ -906,7 +906,7 @@ pub fn linear_extrude(
     for layer in 0..=slices {
         let t = layer as f64 / slices as f64;
         let ang = (-twist * t).to_radians();
-        let (s, c) = (ang.sin(), ang.cos());
+        let (s, c) = (libm::sin(ang), libm::cos(ang));
         let sx = 1.0 + (scale[0] - 1.0) * t;
         let sy = 1.0 + (scale[1] - 1.0) * t;
         let z = z0 + height * t;
@@ -1004,7 +1004,7 @@ fn revolve_one(mesh: &mut Mesh, contour: &[Point2], angle: f64, steps: u32, full
     for k in 0..ring_count {
         let frac = k as f64 / steps as f64;
         let th = (angle * frac).to_radians();
-        let (s, c) = (th.sin(), th.cos());
+        let (s, c) = (libm::sin(th), libm::cos(th));
         for p in contour {
             // 2D point (x=radius, y=height) -> 3D ring.
             mesh.verts.push([p[0] * c, p[0] * s, p[1]]);

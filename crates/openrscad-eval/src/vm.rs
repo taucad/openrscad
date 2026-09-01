@@ -458,7 +458,7 @@ pub fn run(
                         BinOp::Mul => Value::Number(a * b),
                         BinOp::Div => Value::Number(a / b),
                         BinOp::Mod => Value::Number(a % b),
-                        BinOp::Pow => Value::Number(a.powf(b)),
+                        BinOp::Pow => Value::Number(libm::pow(a, b)),
                         BinOp::Eq => Value::Bool(a == b),
                         BinOp::Ne => Value::Bool(a != b),
                         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => match a.partial_cmp(&b) {

@@ -89,7 +89,7 @@ fn arc_points(center: Point2, r: f64, a0: f64, a1: f64, closed: bool) -> Vec<Poi
             // `count` differs for closed vs open arcs; the parameter step does not.
             let t = i as f64 / steps as f64;
             let a = a0 + sweep * t;
-            [center[0] + r * a.cos(), center[1] + r * a.sin()]
+            [center[0] + r * libm::cos(a), center[1] + r * libm::sin(a)]
         })
         .collect()
 }
@@ -373,7 +373,7 @@ fn svg_arc(
     }
     rx = rx.abs();
     ry = ry.abs();
-    let (cosp, sinp) = (phi.cos(), phi.sin());
+    let (cosp, sinp) = (libm::cos(phi), libm::sin(phi));
     let dx = (p0[0] - p1[0]) / 2.0;
     let dy = (p0[1] - p1[1]) / 2.0;
     let x1p = cosp * dx + sinp * dy;
@@ -396,7 +396,7 @@ fn svg_arc(
     let ang = |ux: f64, uy: f64, vx: f64, vy: f64| {
         let dot = ux * vx + uy * vy;
         let len = (ux * ux + uy * uy).sqrt() * (vx * vx + vy * vy).sqrt();
-        let mut a = (dot / len).clamp(-1.0, 1.0).acos();
+        let mut a = libm::acos((dot / len).clamp(-1.0, 1.0));
         if ux * vy - uy * vx < 0.0 {
             a = -a;
         }
@@ -416,8 +416,8 @@ fn svg_arc(
     }
     for i in 1..=CURVE_STEPS {
         let t = theta1 + dtheta * (i as f64 / CURVE_STEPS as f64);
-        let x = cosp * rx * t.cos() - sinp * ry * t.sin() + cx;
-        let y = sinp * rx * t.cos() + cosp * ry * t.sin() + cy;
+        let x = cosp * rx * libm::cos(t) - sinp * ry * libm::sin(t) + cx;
+        let y = sinp * rx * libm::cos(t) + cosp * ry * libm::sin(t) + cy;
         out.push([x, y]);
     }
     let _ = lam;
@@ -801,7 +801,7 @@ fn ellipse_pts(cx: f64, cy: f64, rx: f64, ry: f64) -> Contour {
     (0..n)
         .map(|i| {
             let a = 2.0 * PI * i as f64 / n as f64;
-            [cx + rx * a.cos(), cy + ry * a.sin()]
+            [cx + rx * libm::cos(a), cy + ry * libm::sin(a)]
         })
         .collect()
 }

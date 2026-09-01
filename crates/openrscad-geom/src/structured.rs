@@ -669,10 +669,10 @@ fn balanced_relation<T>(
     Ok(values.pop())
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_arch = "wasm32", test, feature = "rust-relation"))]
 struct RustRelationKernel;
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_arch = "wasm32", test, feature = "rust-relation"))]
 impl RustRelationKernel {
     fn to_manifold(
         mesh: &RelationMesh,
@@ -728,7 +728,7 @@ impl RustRelationKernel {
     }
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(target_arch = "wasm32", test, feature = "rust-relation"))]
 impl RelationKernel for RustRelationKernel {
     fn union(&self, meshes: Vec<RelationMesh>, keys: &RunKeys) -> Result<RelationMesh, GeomError> {
         let manifolds = meshes
@@ -786,9 +786,13 @@ impl RelationKernel for RustRelationKernel {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+// Dead under `rust-relation` (the pure-Rust kernel is dispatched instead); the
+// linker drops it and the C++ Manifold static code with it.
+#[cfg_attr(feature = "rust-relation", allow(dead_code))]
 struct NativeRelationKernel;
 
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(feature = "rust-relation", allow(dead_code))]
 impl NativeRelationKernel {
     fn to_manifold(
         mesh: &RelationMesh,
@@ -1161,7 +1165,7 @@ fn dihedral_between(mesh: &Mesh, left: usize, right: usize) -> f64 {
     };
     let (left, right) = (normal_of(left), normal_of(right));
     let cosine = (left[0] * right[0] + left[1] * right[1] + left[2] * right[2]).clamp(-1.0, 1.0);
-    cosine.acos()
+    libm::acos(cosine)
 }
 
 /// Confirms that the mesh really is laid out ring by ring, returning the ring
@@ -1901,9 +1905,9 @@ pub fn render_structured_cached_diag(
     cache: &mut GeomCache,
     include_backgrounds: bool,
 ) -> Result<(StructuredMesh, super::RenderDiagnostics), GeomError> {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", feature = "rust-relation"))]
     let relation = &RustRelationKernel as &dyn RelationKernel;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", feature = "rust-relation")))]
     let relation = &NativeRelationKernel as &dyn RelationKernel;
     render_structured_with(node, kernel, relation, cache, include_backgrounds)
 }

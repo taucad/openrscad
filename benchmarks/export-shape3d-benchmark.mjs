@@ -340,3 +340,39 @@ export const runExportShape3DBenchmark = async ({ api, fixtures = builtInFixture
   const summary = summarize(raw);
   return { raw, summary, comparisons: compare(summary) };
 };
+
+/**
+ * Diff two engines' artifact hashes over the same fixtures.
+ *
+ * The native addon and the Wasm build are one Rust pipeline behind two
+ * marshalling layers, so every artifact must match to the byte — this is the
+ * gate that keeps that true. It is `collectArtifactParity` run twice and
+ * zipped; there is no second harness, and no tolerance.
+ *
+ * Returns `{ ok, total, mismatches: [{ fixture, format, includeEdges, a, b }] }`.
+ */
+export const nativeVsWasmParity = async ({ wasmApi, nativeApi, fixtures }) => {
+  const [wasm, native] = await Promise.all([
+    collectArtifactParity({ api: wasmApi, fixtures }),
+    collectArtifactParity({ api: nativeApi, fixtures }),
+  ]);
+  if (wasm.length !== native.length) {
+    throw new Error(`parity runs disagree on case count: ${wasm.length} vs ${native.length}`);
+  }
+  const mismatches = [];
+  for (const [index, expected] of wasm.entries()) {
+    const actual = native[index];
+    if (expected.fixture !== actual.fixture || expected.format !== actual.format) {
+      throw new Error(`parity runs disagree on case order at ${index}`);
+    }
+    if (expected.sha256 === actual.sha256 && expected.bytes === actual.bytes) continue;
+    mismatches.push({
+      fixture: expected.fixture,
+      format: expected.format,
+      includeEdges: expected.includeEdges,
+      wasm: { bytes: expected.bytes, sha256: expected.sha256 },
+      native: { bytes: actual.bytes, sha256: actual.sha256 },
+    });
+  }
+  return { ok: mismatches.length === 0, total: wasm.length, mismatches };
+};

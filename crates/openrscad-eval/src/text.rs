@@ -63,9 +63,10 @@ fn db() -> &'static RwLock<Database> {
 /// first call scans, later calls are no-ops. Hosts that want reproducible,
 /// machine-independent output (e.g. the geometry oracle) simply never call it.
 pub fn register_system_fonts() {
-    // Filesystem font loading is native-only (the `fs` fontdb feature); on wasm
-    // this is a no-op — the browser supplies fonts via [`register_font_data`].
-    #[cfg(not(target_arch = "wasm32"))]
+    // Filesystem font loading needs the `system-fonts` feature (and a
+    // filesystem); everywhere else this is a no-op and the host supplies fonts
+    // via [`register_font_data`].
+    #[cfg(all(feature = "system-fonts", not(target_arch = "wasm32")))]
     {
         use std::sync::atomic::{AtomicBool, Ordering};
         static LOADED: AtomicBool = AtomicBool::new(false);

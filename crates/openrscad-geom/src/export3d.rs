@@ -521,7 +521,7 @@ fn srgb_to_linear(value: u8) -> f32 {
     if value <= 0.04045 {
         value / 12.92
     } else {
-        ((value + 0.055) / 1.055).powf(2.4)
+        libm::powf((value + 0.055) / 1.055, 2.4)
     }
 }
 
@@ -711,7 +711,7 @@ fn dihedral_degrees(mesh: &Mesh, left: usize, right: usize) -> f64 {
         .map(|(left, right)| left * right)
         .sum::<f64>()
         .clamp(-1.0, 1.0);
-    cosine.acos().to_degrees()
+    libm::acos(cosine).to_degrees()
 }
 
 /// Decides, for every edge that separates two distinct classified patches,
@@ -2627,5 +2627,130 @@ mod tests {
         assert_eq!(primitives[0]["mode"], 4);
         assert_eq!(primitives[1]["mode"], 4);
         assert_eq!(primitives[2]["mode"], 1);
+    }
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        hash
+    }
+
+    /// The export path must be self-consistent inside one process: the same
+    /// scene exported twenty times in a row has to produce the same bytes.
+    ///
+    /// It did not before every order-affecting `std::collections::HashMap` /
+    /// `HashSet` in this crate was replaced by a deterministic hasher (and the
+    /// hull horizon by a `BTreeSet`): `RandomState` reseeds per map instance,
+    /// so iteration order depended on how many maps the thread had already
+    /// built and the twentieth export differed from the first. That broke
+    /// artifact hashing, every build cache keyed on the artifact, and any
+    /// native/wasm byte-parity gate — the reference was not stable against
+    /// itself.
+    #[test]
+    fn repeated_export_in_one_process_is_byte_identical() {
+        // A `tau-plaque`-shaped scene: a rounded slab built by hulling four
+        // cylinders (the convex-hull horizon is the one hash container in this
+        // crate whose iteration reaches the output), unioned with an extruded
+        // rim and drilled by counterbored holes, under one colour so the whole
+        // thing is one attributed surface.
+        let frags = FragmentSpec {
+            fn_: 0.0,
+            fa: 12.0,
+            fs: 2.0,
+        };
+        let pillar = |x: f64, y: f64| Node::Translate {
+            v: [x, y, 0.0],
+            child: Box::new(Node::Cylinder {
+                h: 6.0,
+                r1: 6.0,
+                r2: 6.0,
+                center: false,
+                frags,
+            }),
+        };
+        let hole = |x: f64, y: f64| Node::Translate {
+            v: [x, y, -1.0],
+            child: Box::new(Node::Cylinder {
+                h: 12.0,
+                r1: 2.0,
+                r2: 2.0,
+                center: false,
+                frags,
+            }),
+        };
+        let node = Node::Color {
+            rgba: [0.184, 0.208, 0.259, 1.0],
+            child: Box::new(Node::Difference(vec![
+                Node::Union(vec![
+                    Node::Hull(vec![
+                        pillar(0.0, 0.0),
+                        pillar(60.0, 0.0),
+                        pillar(0.0, 30.0),
+                        pillar(60.0, 30.0),
+                    ]),
+                    Node::Translate {
+                        v: [30.0, 15.0, 5.9],
+                        child: Box::new(Node::LinearExtrude {
+                            height: 2.0,
+                            center: false,
+                            twist: 0.0,
+                            scale: [1.0, 1.0],
+                            slices: 1,
+                            child: Box::new(Node::Circle { r: 8.0, frags }),
+                        }),
+                    },
+                ]),
+                hole(6.0, 6.0),
+                hole(54.0, 6.0),
+                hole(6.0, 24.0),
+                hole(54.0, 24.0),
+            ])),
+        };
+        let options = Export3DOptions::default();
+        let mut hashes = std::collections::BTreeSet::new();
+        for _ in 0..20 {
+            let structured = render_structured_rust_cached(
+                &node,
+                &RustManifoldKernel::new(),
+                &mut GeomCache::new(),
+            )
+            .unwrap();
+            hashes.insert(fnv1a(&serialize_glb(&structured, &options).unwrap()));
+            let structured = render_structured_rust_cached(
+                &node,
+                &RustManifoldKernel::new(),
+                &mut GeomCache::new(),
+            )
+            .unwrap();
+            hashes.insert(fnv1a(&serialize_3mf(&structured, &options).unwrap()));
+        }
+        assert_eq!(
+            hashes.len(),
+            2,
+            "twenty in-process exports produced {} distinct artifacts (expected one GLB + one 3MF)",
+            hashes.len()
+        );
+    }
+
+    /// `srgb_to_linear` feeds every GLB material, so a one-ULP difference in
+    /// `powf` makes 100% of GLBs differ between two builds — which is exactly
+    /// what `f32::powf` did (Apple's libm natively, Rust's bundled one on
+    /// wasm32). It now goes through the `libm` crate on both targets; this
+    /// freezes all 256 outputs so the curve cannot drift silently.
+    #[test]
+    fn srgb_to_linear_curve_is_frozen() {
+        let bits: Vec<u8> = (0..=255u8)
+            .flat_map(|value| srgb_to_linear(value).to_bits().to_le_bytes())
+            .collect();
+        assert_eq!(srgb_to_linear(0), 0.0);
+        assert_eq!(srgb_to_linear(255), 1.0);
+        // 10 and 11 straddle the linear/gamma branch at 0.04045.
+        assert_eq!(srgb_to_linear(10).to_bits(), 0x3b46_eb61);
+        assert_eq!(srgb_to_linear(11).to_bits(), 0x3b5b_518d);
+        assert_eq!(srgb_to_linear(128).to_bits(), 0x3e5d_0a8b);
+        assert_eq!(fnv1a(&bits), 0x1a45_ac26_a93d_8502, "the sRGB curve moved");
     }
 }

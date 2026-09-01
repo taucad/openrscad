@@ -1,0 +1,54 @@
+{
+  "name": "@taulabs/openrscad-engine-native",
+  "version": "0.11.0-beta.2",
+  "description": "Tau's fork of the OpenRSCAD geometry engine as a Node N-API addon — the same pipeline @taulabs/openrscad-engine compiles to WebAssembly, built native for CLI, CI, daemon and desktop hosts. Byte-identical artifacts to the wasm build.",
+  "type": "module",
+  "license": "Apache-2.0 OR MIT",
+  "author": "Matt Hova",
+  "homepage": "https://github.com/taucad/openrscad",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taucad/openrscad.git",
+    "directory": "packages/npm-native"
+  },
+  "bugs": {
+    "url": "https://github.com/taucad/openrscad/issues"
+  },
+  "keywords": ["openscad", "scad", "cad", "napi", "native", "node-api", "geometry", "csg", "3d", "mesh", "openrscad"],
+  "types": "./dist/node.d.ts",
+  "exports": {
+    ".": {
+      "node": {
+        "types": "./dist/node.d.ts",
+        "default": "./dist/node.js"
+      },
+      "default": {
+        "types": "./dist/node.d.ts",
+        "default": "./dist/node.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": ["dist", "README.md", "LICENSE-APACHE", "LICENSE-MIT"],
+  "napi": {
+    "binaryName": "openrscad",
+    "packageName": "@taulabs/openrscad-engine-native",
+    "targets": ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+  },
+  "scripts": {
+    "build": "npm run build:addon && npm run build:facade",
+    "build:addon": "napi build --platform --release --esm --js index.js --dts index.d.ts --output-dir ./src/native --manifest-path ../../crates/openrscad-napi/Cargo.toml",
+    "build:facade": "tsc -p tsconfig.json && node scripts/copy-native.mjs",
+    "test": "npm run build:facade && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@taulabs/openrscad-engine": "0.11.0-beta.2"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.8.6",
+    "typescript": "^5.5.3"
+  }
+}

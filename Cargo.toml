@@ -5,8 +5,10 @@ members = [
     "crates/openrscad-ir",
     "crates/openrscad-eval",
     "crates/openrscad-geom",
+    "crates/openrscad-api",
     "crates/openrscad-cli",
     "crates/openrscad-wasm",
+    "crates/openrscad-napi",
     "crates/openrscad-lsp",
     "xtask",
 ]
@@ -23,11 +25,19 @@ openrscad-syntax = { path = "crates/openrscad-syntax" }
 openrscad-ir = { path = "crates/openrscad-ir" }
 openrscad-eval = { path = "crates/openrscad-eval" }
 openrscad-geom = { path = "crates/openrscad-geom" }
+openrscad-api = { path = "crates/openrscad-api" }
 
 logos = "0.15"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Target-independent transcendentals. `f64::sin` and friends lower to the
+# platform libm (Apple's natively, Rust's bundled one on wasm32) and disagree in
+# the last f64 ULP, which is enough to change a 3MF artifact and to break
+# native/wasm byte parity. Every path that can reach a serialized artifact —
+# the SCAD builtins in `openrscad-eval` and the tessellators in
+# `openrscad-geom` — goes through this crate instead.
+libm = "0.2"
 rustc-hash = "2"
 ttf-parser = "0.25"
 earcutr = "0.4"

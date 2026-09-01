@@ -2443,7 +2443,7 @@ fn axis_angle_matrix(axis: Vec3, angle_deg: f64) -> [[f64; 4]; 4] {
     let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
     let [x, y, z] = [axis[0] / len, axis[1] / len, axis[2] / len];
     let t = angle_deg.to_radians();
-    let (c, s, k) = (t.cos(), t.sin(), 1.0 - t.cos());
+    let (c, s, k) = (libm::cos(t), libm::sin(t), 1.0 - libm::cos(t));
     [
         [c + x * x * k, x * y * k - z * s, x * z * k + y * s, 0.0],
         [y * x * k + z * s, c + y * y * k, y * z * k - x * s, 0.0],
@@ -2856,21 +2856,21 @@ fn builtin_fn(name: &str, args: &[Value], warnings: &mut Vec<String>) -> Value {
         "ceil" => one(f64::ceil),
         "round" => one(f64::round),
         "sqrt" => one(f64::sqrt),
-        "exp" => one(f64::exp),
-        "ln" => one(f64::ln),
-        "log" => one(f64::log10),
+        "exp" => one(libm::exp),
+        "ln" => one(libm::log),
+        "log" => one(libm::log10),
         "sin" => one(sin_deg),
         "cos" => one(cos_deg),
         "tan" => one(tan_deg),
-        "asin" => one(|x| x.asin().to_degrees()),
-        "acos" => one(|x| x.acos().to_degrees()),
-        "atan" => one(|x| x.atan().to_degrees()),
+        "asin" => one(|x| libm::asin(x).to_degrees()),
+        "acos" => one(|x| libm::acos(x).to_degrees()),
+        "atan" => one(|x| libm::atan(x).to_degrees()),
         "atan2" => match (num(0), num(1)) {
-            (Some(y), Some(x)) => Value::Number(y.atan2(x).to_degrees()),
+            (Some(y), Some(x)) => Value::Number(libm::atan2(y, x).to_degrees()),
             _ => Value::Undef,
         },
         "pow" => match (num(0), num(1)) {
-            (Some(b), Some(e)) => Value::Number(b.powf(e)),
+            (Some(b), Some(e)) => Value::Number(libm::pow(b, e)),
             _ => Value::Undef,
         },
         "max" => reduce_num(args, f64::max),
@@ -3017,7 +3017,7 @@ fn sin_deg(x: f64) -> f64 {
         0.0 | 180.0 => 0.0,
         90.0 => 1.0,
         270.0 => -1.0,
-        a => a.to_radians().sin(),
+        a => libm::sin(a.to_radians()),
     }
 }
 fn cos_deg(x: f64) -> f64 {
@@ -3025,7 +3025,7 @@ fn cos_deg(x: f64) -> f64 {
         0.0 => 1.0,
         90.0 | 270.0 => 0.0,
         180.0 => -1.0,
-        a => a.to_radians().cos(),
+        a => libm::cos(a.to_radians()),
     }
 }
 fn tan_deg(x: f64) -> f64 {
@@ -3038,7 +3038,7 @@ fn tan_deg(x: f64) -> f64 {
         135.0 | 315.0 => -1.0,
         90.0 => f64::INFINITY,
         270.0 => f64::NEG_INFINITY,
-        a => a.to_radians().tan(),
+        a => libm::tan(a.to_radians()),
     }
 }
 

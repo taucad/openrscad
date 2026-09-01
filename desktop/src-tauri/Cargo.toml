@@ -37,7 +37,7 @@ serde_json = "1"
 notify = "6"
 
 openrscad-syntax = { path = "../../crates/openrscad-syntax" }
-openrscad-eval = { path = "../../crates/openrscad-eval" }
+openrscad-eval = { path = "../../crates/openrscad-eval", features = ["system-fonts"] }
 openrscad-geom = { path = "../../crates/openrscad-geom" }
 
 [profile.release]

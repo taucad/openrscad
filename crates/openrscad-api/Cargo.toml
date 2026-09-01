@@ -1,0 +1,21 @@
+[package]
+name = "openrscad-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+benchmark-profile = ["dep:serde_json", "dep:web-time", "openrscad-geom/benchmark-profile"]
+# Force the pure-Rust relation kernel natively so a native host serializes the
+# same bytes as the wasm build (which has no choice). Propagated by hosts that
+# want byte parity; `openrscad-cli` deliberately does not set it.
+rust-relation = ["openrscad-geom/rust-relation"]
+
+[dependencies]
+openrscad-syntax = { workspace = true }
+openrscad-eval = { workspace = true }
+openrscad-geom = { workspace = true }
+serde_json = { version = "1", optional = true }
+web-time = { version = "1", optional = true }

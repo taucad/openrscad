@@ -109,7 +109,7 @@ pub fn convex_hull(pts: &[P]) -> Mesh {
         }
         // Horizon = directed edges of visible faces whose reverse isn't also
         // in a visible face.
-        let mut edges: std::collections::HashSet<(usize, usize)> = Default::default();
+        let mut edges: std::collections::BTreeSet<(usize, usize)> = Default::default();
         for &fi in &visible {
             let f = faces[fi];
             for &(a, b) in &[(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
@@ -174,5 +174,37 @@ mod tests {
         let m = convex_hull(&pts);
         assert!((m.volume() - 8.0).abs() < 1e-6, "hull vol {}", m.volume());
         assert!(m.signed_volume() > 0.0);
+    }
+
+    /// The horizon set is the one hash container in this crate whose iteration
+    /// order reaches serialized output: it decides the order new faces are
+    /// pushed, hence the triangle order of every hulled solid.
+    ///
+    /// With `std::collections::HashSet` that order changed on every call —
+    /// `RandomState` reseeds per map instance from a thread-local counter — so
+    /// twenty hulls of the same points in one process produced twenty
+    /// different triangle orders, and a long-lived worker emitted two
+    /// different GLBs for the same document (measured on `tau-plaque`:
+    /// 174,992 B / 174,656 B alternating). A `BTreeSet` makes the order a
+    /// property of the geometry instead of the allocator.
+    #[test]
+    fn convex_hull_triangle_order_is_deterministic() {
+        let mut points: Vec<[f64; 3]> = Vec::new();
+        for (cx, cy) in [(0.0, 0.0), (60.0, 0.0), (0.0, 30.0), (60.0, 30.0)] {
+            for step in 0..32 {
+                let angle = f64::from(step) * std::f64::consts::TAU / 32.0;
+                for z in [0.0f64, 6.0] {
+                    points.push([cx + 6.0 * libm::cos(angle), cy + 6.0 * libm::sin(angle), z]);
+                }
+            }
+        }
+        let orders: std::collections::BTreeSet<Vec<[u32; 3]>> =
+            (0..20).map(|_| super::convex_hull(&points).tris).collect();
+        assert_eq!(
+            orders.len(),
+            1,
+            "{} distinct hull triangle orders in 20 calls",
+            orders.len()
+        );
     }
 }

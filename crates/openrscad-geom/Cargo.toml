@@ -8,6 +8,9 @@ rust-version.workspace = true
 
 [features]
 benchmark-profile = ["dep:web-time"]
+# Force the pure-Rust relation kernel on native targets so native and wasm
+# serialize the same artifact (the wasm build is the reference semantics).
+rust-relation = []
 
 [dependencies]
 openrscad-ir = { workspace = true }
@@ -21,6 +24,7 @@ earcutr = { workspace = true }
 geo = { workspace = true }
 # DEFLATE decompression for 3MF import (ZIP entries are deflate-compressed).
 miniz_oxide = { workspace = true }
+libm = { workspace = true }
 serde_json = "1"
 web-time = { version = "1", optional = true }
 

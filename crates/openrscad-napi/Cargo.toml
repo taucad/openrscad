@@ -1,0 +1,26 @@
+[package]
+name = "openrscad-napi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# `rust-relation` is not optional here: a native build that used the C++
+# relation kernel would serialize a structurally different artifact from the
+# wasm build (different triangle partition, −10% surface area on boolean-heavy
+# models), and the whole point of this addon is that it does not.
+#
+# `openrscad-eval` is taken WITHOUT `system-fonts` so `text()` cannot pick up
+# host fonts the browser has never heard of.
+openrscad-api = { workspace = true, features = ["rust-relation"] }
+napi = { version = "3", default-features = false, features = ["napi8"] }
+napi-derive = "3"
+
+[build-dependencies]
+napi-build = "2"

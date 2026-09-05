@@ -1,0 +1,62 @@
+name: Download a verified artifact
+description: Download one artifact, prove it landed, and retry once when it did not.
+inputs:
+  name:
+    description: Artifact name. Leave unset to select by pattern.
+    required: false
+    default: ''
+  pattern:
+    description: Artifact name pattern. Leave unset to select by name.
+    required: false
+    default: ''
+  path:
+    description: Directory the artifact must land in.
+    required: true
+  merge-multiple:
+    description: Merge every matched artifact into one directory.
+    required: false
+    default: 'false'
+  expect:
+    description: >-
+      Whitespace-separated paths, relative to `path`, that the artifact must
+      contain. A non-empty directory is required either way.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        pattern: ${{ inputs.pattern }}
+        path: ${{ inputs.path }}
+        merge-multiple: ${{ inputs.merge-multiple }}
+    - id: verify
+      shell: bash
+      env:
+        ARTIFACT: ${{ inputs.name }}${{ inputs.pattern }}
+        ARTIFACT_PATH: ${{ inputs.path }}
+        EXPECT: ${{ inputs.expect }}
+      run: |
+        if bash .github/actions/download-verified-artifact/verify-artifact.sh; then
+          echo 'complete=true' >> "$GITHUB_OUTPUT"
+        else
+          echo 'complete=false' >> "$GITHUB_OUTPUT"
+          echo "::warning::retrying the '$ARTIFACT' download once"
+        fi
+    # One retry, then the run fails. A silent empty download is transient; an
+    # artifact that is genuinely absent must not be waited on.
+    - if: steps.verify.outputs.complete == 'false'
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.name }}
+        pattern: ${{ inputs.pattern }}
+        path: ${{ inputs.path }}
+        merge-multiple: ${{ inputs.merge-multiple }}
+    - if: steps.verify.outputs.complete == 'false'
+      shell: bash
+      env:
+        ARTIFACT: ${{ inputs.name }}${{ inputs.pattern }}
+        ARTIFACT_PATH: ${{ inputs.path }}
+        EXPECT: ${{ inputs.expect }}
+      run: bash .github/actions/download-verified-artifact/verify-artifact.sh

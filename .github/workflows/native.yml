@@ -1,0 +1,319 @@
+name: Native addon
+
+# Build, assemble, gate and smoke the N-API addon that `@taulabs/openrscad-engine`
+# colocates with its WebAssembly build. Called twice: from `ci.yml` for evidence
+# on every push, pull request and dispatch, and from `publish-npm.yml` for a
+# release. It has no publication step and no `id-token: write` anywhere, so a
+# manual run is evidence-only by construction (napi-architecture-policy §6).
+#
+# The build matrix below is the ONLY place the five targets are spelled outside
+# `packages/npm/package.json`'s `napi.targets`, and `scripts/workflow-policy.test.mjs`
+# asserts the two agree (policy §1). Everything downstream — platform directories,
+# root `optionalDependencies`, the inspection's per-target expectations, the packed
+# tarballs, the smoke's package selection — is derived from that authority.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit-ish to build. Empty builds the ref that triggered the caller.
+        required: false
+        type: string
+        default: ''
+      retention-days:
+        description: >-
+          How long the frozen release archive is kept. A release run needs it to
+          outlive the operator's recovery window, because npm publication is not
+          transactional and a retry must reuse the same bytes (policy §7).
+        required: false
+        type: number
+        default: 1
+    outputs:
+      archive:
+        description: Filename of the frozen prepared-release archive.
+        value: ${{ jobs.assemble.outputs.archive }}
+      sha256:
+        description: SHA-256 of that archive.
+        value: ${{ jobs.assemble.outputs.sha256 }}
+      version:
+        description: Version the prepared tree carries.
+        value: ${{ jobs.assemble.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          # macOS 13 runners are retired; `macos-15-intel` is the hosted x64 image.
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          # Pinned rather than `ubuntu-latest`: the glibc these rows link against
+          # is a consumer requirement, and `scripts/inspect-native.mjs` asserts a
+          # ceiling that only means something beside a fixed image.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      # `clang` clamps the arm64 slice to 11.0 regardless; the x64 slice records
+      # this floor, and `inspect-native.mjs` derives its expectation from it.
+      MACOSX_DEPLOYMENT_TARGET: '10.13'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: false
+
+      # No cmake anywhere in this workflow: `openrscad-napi` takes
+      # `openrscad-geom` without the `cpp-relation` feature, so the C++ Manifold
+      # kernel is not in its dependency graph and every row is pure Rust.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-napi-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/npm/package-lock.json
+
+      - name: Install engine package dependencies
+        working-directory: packages/npm
+        run: npm ci
+
+      # One build recipe, in `package.json`: the row only adds its target.
+      - name: Build the addon
+        working-directory: packages/npm
+        run: npm run build:addon -- --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: packages/npm/src/native/openrscad.*.node
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      archive: ${{ steps.freeze.outputs.archive }}
+      sha256: ${{ steps.freeze.outputs.sha256 }}
+      version: ${{ steps.freeze.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          # llvm-readobj/llvm-objdump for the binary inspection, from the same
+          # toolchain that built the addons.
+          components: llvm-tools
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-assemble-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install wasm-pack
+        run: |
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/npm/package-lock.json
+
+      - name: Install engine package dependencies
+        working-directory: packages/npm
+        run: npm ci
+
+      # Every package-manager script the assembly needs runs HERE, before
+      # `napi pre-publish` rewrites the manifest and npm's pre-run dependency
+      # check starts refusing the now-stale lockfile (policy §5). This also
+      # generates the loader `dist/native/index.js` that the root tarball ships.
+      - name: Build the wasm payloads, the host addon and the facade
+        working-directory: packages/npm
+        run: npm run build
+
+      - name: Name the addons the download must land
+        id: expected
+        run: |
+          files="$(node -e "import('./scripts/lib/napi-targets.mjs').then((m) => process.stdout.write(m.readNapiTargets('packages/npm/package.json').packages.map((target) => target.binary).join(' ')))")"
+          echo "files=$files" >> "$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/download-verified-artifact
+        with:
+          pattern: bindings-*
+          path: packages/npm/artifacts
+          merge-multiple: true
+          expect: ${{ steps.expected.outputs.files }}
+
+      - name: Generate the five platform directories
+        working-directory: packages/npm
+        run: npx napi create-npm-dirs --npm-dir npm
+
+      - name: Collect the native addons
+        working-directory: packages/npm
+        run: npx napi artifacts --output-dir artifacts --npm-dir npm
+
+      # NAPI-RS generates the `license` FIELD but no licence text, and npm
+      # force-packs `LICENSE.*` (never `LICENSE-*`) whatever `files` says, so the
+      # dual licence is copied under names npm will actually ship.
+      - name: Copy the physical licences into every platform package
+        working-directory: packages/npm
+        run: |
+          for directory in npm/*/; do
+            cp ../../LICENSE-APACHE "$directory/LICENSE.APACHE"
+            cp ../../LICENSE-MIT "$directory/LICENSE.MIT"
+          done
+
+      # `napi artifacts` matches by filename suffix and never opens a binary.
+      - name: Inspect every native binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+        run: node scripts/inspect-native.mjs
+
+      - name: Reconcile the platform manifests without publishing
+        working-directory: packages/npm
+        run: npx napi pre-publish --skip-optional-publish -t npm --no-gh-release
+
+      - name: Assert the prepared release is complete
+        run: node scripts/check-prepared-release.mjs
+
+      - name: Pack the frozen test tarballs
+        run: node scripts/pack-test-tarballs.mjs --out tarballs
+
+      - name: Validate the root tarball contract
+        run: node scripts/validate-pack.mjs
+
+      - id: freeze
+        name: Freeze the prepared release tree
+        working-directory: packages/npm
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          rm -rf prepared
+          mkdir -p prepared
+          node <<'NODE'
+          const { cpSync, existsSync } = require('node:fs');
+          const declared = require('./package.json').files.filter((entry) => !entry.startsWith('!'));
+          for (const entry of [...declared, 'package.json', 'npm', 'test-tarballs.json']) {
+            if (!existsSync(entry)) throw new Error(`prepared release is missing ${entry}`);
+            cpSync(entry, `prepared/${entry}`, { recursive: true });
+          }
+          NODE
+          archive="prepared-release-$version.tgz"
+          tar -czf "$archive" -C prepared .
+          sha256sum "$archive" > "$archive.sha256"
+          size="$(wc -c < "$archive")"
+          if [ "$size" -gt 167772160 ]; then
+            echo "::error::prepared release archive is $size bytes, above the 160 MB ceiling"
+            exit 1
+          fi
+          {
+            echo "archive=$archive"
+            echo "sha256=$(cut -d' ' -f1 < "$archive.sha256")"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prepared-release
+          path: |
+            packages/npm/prepared-release-*.tgz
+            packages/npm/prepared-release-*.tgz.sha256
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-tarballs
+          path: tarballs/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+
+  # The byte-parity gate (blueprint G5): every row installs the frozen tarballs
+  # the way a consumer would and proves the addon it just got produces the same
+  # bytes as the WebAssembly build shipped beside it. A row that disagrees fails
+  # the release; there is no tolerance and no support-claim downgrade.
+  smoke:
+    name: smoke (${{ matrix.suffix }})
+    needs: assemble
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suffix: darwin-arm64
+            os: macos-latest
+          - suffix: darwin-x64
+            os: macos-15-intel
+          - suffix: linux-x64-gnu
+            os: ubuntu-24.04
+            # One row also proves the other direction of the fallback: with the
+            # platform package removed the entry keeps the engine through wasm.
+            fallback: '1'
+          - suffix: linux-arm64-gnu
+            os: ubuntu-24.04-arm
+          - suffix: win32-x64-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: false
+
+      - uses: ./.github/actions/download-verified-artifact
+        with:
+          name: test-tarballs
+          path: tarballs
+          expect: test-tarballs.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # No dependency install: this room is clean on purpose, and the smoke
+      # script imports nothing but Node builtins and repository files.
+      - name: Render from the frozen tarballs and compare bytes with wasm
+        env:
+          OPENRSCAD_NATIVE_SUFFIX: ${{ matrix.suffix }}
+          OPENRSCAD_SMOKE_FALLBACK: ${{ matrix.fallback }}
+          OPENRSCAD_TARBALL_DIR: tarballs
+        run: node packages/npm/test/smoke-installed.mjs

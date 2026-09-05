@@ -164,6 +164,10 @@ const consumeExportResult = (result: RawExportResult): ExportShape3DOutput => {
   }
 };
 
+/** Which engine binding a module bound: the N-API addon, or the WebAssembly
+ *  build. Only the Node entry can report `"native"`. */
+export type Backend = "native" | "wasm";
+
 /** The generated wasm-bindgen exports this facade wraps. */
 export interface RawEngine {
   render_with_files(

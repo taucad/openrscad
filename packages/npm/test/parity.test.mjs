@@ -1,10 +1,13 @@
 // The native addon and the Wasm build are the same Rust pipeline behind two
-// marshalling layers. This is the gate that keeps that literally true: every
-// built-in fixture, both edge modes, GLB and 3MF, byte for byte.
+// marshalling layers, and one package now ships both. This is the gate that
+// keeps the claim literally true: every built-in fixture, both edge modes, GLB
+// and 3MF, byte for byte.
 //
-// Requires local builds of BOTH engines (`npm run build` here and in
-// ../npm) — never the published tarball, whose Rust predates any change
-// under test.
+// `../dist/node.js` is the entry under test — it binds the addon when one
+// matches this host. The Wasm side is rebuilt in-process from `./core`'s
+// `makeApi()` over the raw `./node` glue, which is the same facade the entry
+// falls back to, so no second package and no published tarball is involved.
+// Requires a local `npm run build` (wasm + addon + facade).
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -13,8 +16,11 @@ import {
   builtInFixtures,
   nativeVsWasmParity,
 } from "../../../benchmarks/export-shape3d-benchmark.mjs";
+import { makeApi } from "../dist/core.js";
 import * as nativeApi from "../dist/node.js";
-import * as wasmApi from "../../npm/dist/node.js";
+import * as glue from "../pkg/node/openrscad.js";
+
+const wasmApi = makeApi(glue, () => Promise.resolve());
 
 const fixtures = async () => {
   const font = await readFile(
@@ -24,6 +30,14 @@ const fixtures = async () => {
     fixture.name === "text" ? { ...fixture, options: { fontFiles: [font] } } : fixture,
   );
 };
+
+test("the Node entry binds the native addon on a covered host", () => {
+  assert.equal(
+    nativeApi.backend,
+    "native",
+    `the entry fell back to wasm, so this file would compare wasm to itself: ${nativeApi.backendCause}`,
+  );
+});
 
 test("every built-in artifact is byte-identical between the native addon and Wasm", async () => {
   const result = await nativeVsWasmParity({

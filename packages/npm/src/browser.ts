@@ -13,7 +13,7 @@ import init, {
   version as rawVersion,
   clear_cache as rawClearCache,
 } from "../pkg/web/openrscad.js";
-import { makeApi, type RawEngine } from "./core.js";
+import { makeApi, type Backend, type RawEngine } from "./core.js";
 
 let ready: Promise<void> | null = null;
 
@@ -34,6 +34,14 @@ const engine = {
   clear_cache: rawClearCache,
 } as unknown as RawEngine;
 
+/** Always `"wasm"` here: the browser entry has no addon to bind. The Node entry
+ *  is the one that can report `"native"`. */
+export const backend: Backend = "wasm";
+
+/** Always `undefined` here — kept so the browser and Node entries stay
+ *  interchangeable (`src/api-parity.ts`). */
+export const backendCause: unknown = undefined;
+
 const api = makeApi(engine, ensureReady);
 
 export const render = api.render;
@@ -45,6 +53,7 @@ export const version = api.version;
 export const clearCache = api.clearCache;
 
 export type {
+  Backend,
   Diagnostic,
   ExportGlbOptions,
   ExportShape3DFormat,

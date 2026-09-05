@@ -97,7 +97,7 @@
     "lineSegments": 52
   },
   "geom/hullmink_hull_points.scad": {
-    "lineSegments": 13
+    "lineSegments": 23
   },
   "geom/hullmink_minkowski_2d.scad": {
     "lineSegments": 62
@@ -106,7 +106,7 @@
     "lineSegments": 208
   },
   "geom/hullmink_minkowski_concave.scad": {
-    "lineSegments": 102
+    "lineSegments": 103
   },
   "geom/import_3mf.scad": {
     "lineSegments": 268
@@ -169,7 +169,7 @@
     "lineSegments": 569
   },
   "geom/text_serif.scad": {
-    "lineSegments": 815
+    "lineSegments": 816
   },
   "geom/xf_mirror.scad": {
     "lineSegments": 12

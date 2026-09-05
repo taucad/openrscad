@@ -12,6 +12,10 @@ import init, {
   parameters as rawParameters,
   version as rawVersion,
   clear_cache as rawClearCache,
+  cache_export as rawCacheExport,
+  cache_import as rawCacheImport,
+  cache_stats as rawCacheStats,
+  cache_keys as rawCacheKeys,
 } from "../pkg/web/openrscad.js";
 import { makeApi, type Backend, type RawEngine } from "./core.js";
 
@@ -32,6 +36,10 @@ const engine = {
   parameters: rawParameters,
   version: rawVersion,
   clear_cache: rawClearCache,
+  cache_export: rawCacheExport,
+  cache_import: rawCacheImport,
+  cache_stats: rawCacheStats,
+  cache_keys: rawCacheKeys,
 } as unknown as RawEngine;
 
 /** Always `"wasm"` here: the browser entry has no addon to bind. The Node entry
@@ -51,9 +59,15 @@ export const exportShape3D = api.exportShape3D;
 export const parameters = api.parameters;
 export const version = api.version;
 export const clearCache = api.clearCache;
+export const exportCache = api.exportCache;
+export const importCache = api.importCache;
+export const cacheStats = api.cacheStats;
+export const cacheKeys = api.cacheKeys;
 
 export type {
   Backend,
+  CacheImportReport,
+  CacheStats,
   Diagnostic,
   ExportGlbOptions,
   ExportShape3DFormat,

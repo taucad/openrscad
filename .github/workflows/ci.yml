@@ -343,6 +343,12 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # `npm run build` below is wasm + addon + facade, and the addon build needs
+      # this package's own `@napi-rs/cli`. The root install does not provide it.
+      - name: Install engine package dependencies
+        working-directory: packages/npm
+        run: npm ci
+
       - name: Build the Node Wasm facade
         working-directory: packages/npm
         run: npm run build

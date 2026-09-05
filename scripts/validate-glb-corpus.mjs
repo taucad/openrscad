@@ -2,12 +2,13 @@
 // Export a globbed SCAD corpus through a built Node facade and validate every
 // GLB, with and without feature edges, using Khronos glTF Validator.
 //
-// `--api native` runs the same corpus through the N-API addon instead of the
-// Wasm build. Both engines are the same Rust pipeline, so a corpus that passes
-// on one and fails on the other is a parity defect, not a validator finding.
+// One package, two payloads: `packages/npm`'s `node` entry binds the N-API addon
+// when a platform package matches this host and the in-package Wasm build when
+// none does. There is no engine to select here any more — the entry reports which
+// one bound, and the report records it.
 //
 // Usage: node scripts/validate-glb-corpus.mjs --root DIR [--report FILE]
-//          [--budgets FILE] [--api wasm|native] GLOB...
+//          [--budgets FILE] GLOB...
 // Exit: 0 all valid; 1 bad input/export/validation/budget; 3 missing build/dependency.
 
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -23,20 +24,16 @@ const parseArgs = (args) => {
   let root = process.cwd();
   let report;
   let budgets;
-  let api = "wasm";
   const patterns = [];
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === "--root") root = args[++index];
     else if (args[index] === "--report") report = args[++index];
     else if (args[index] === "--budgets") budgets = args[++index];
-    else if (args[index] === "--api") api = args[++index];
     else patterns.push(args[index]);
   }
   if (!root || patterns.length === 0 || patterns.some((pattern) => !pattern)) return null;
   if (budgets === "") return null;
-  if (api !== "wasm" && api !== "native") return null;
   return {
-    api,
     budgets: budgets && resolve(budgets),
     root: resolve(root),
     report: report && resolve(report),
@@ -55,7 +52,7 @@ const main = async () => {
   const options = parseArgs(process.argv.slice(2));
   if (!options) {
     console.error(
-      "Usage: node scripts/validate-glb-corpus.mjs --root DIR [--report FILE] [--api wasm|native] GLOB...",
+      "Usage: node scripts/validate-glb-corpus.mjs --root DIR [--report FILE] [--budgets FILE] GLOB...",
     );
     process.exit(1);
   }
@@ -83,20 +80,17 @@ const main = async () => {
     }
   }
 
+  let backend;
   let exportShape3D;
   let validateBytes;
   let declaredValidatorVersion;
   try {
-    ({ exportShape3D } = await import(
-      options.api === "native"
-        ? resolve(import.meta.dirname, "../packages/npm-native/dist/node.js")
-        : resolve(import.meta.dirname, "../packages/npm/dist/node.js"),
+    ({ backend, exportShape3D } = await import(
+      resolve(import.meta.dirname, "../packages/npm/dist/node.js")
     ));
     ({ validateBytes, version: declaredValidatorVersion } = await validatorModule());
   } catch (error) {
-    console.error(
-      `ERROR: build packages/${options.api === "native" ? "npm-native" : "npm"} and install gltf-validator: ${error.message}`,
-    );
+    console.error(`ERROR: build packages/npm and install gltf-validator: ${error.message}`);
     process.exit(3);
   }
 
@@ -188,7 +182,7 @@ const main = async () => {
 
   const failed = results.filter((result) => !result.ok).length;
   const report = {
-    api: options.api,
+    backend,
     assetRoot,
     budgets: options.budgets ?? null,
     corpusRoot: options.root,
@@ -203,7 +197,7 @@ const main = async () => {
   if (failed === 0) {
     await rm(outputDirectory, { recursive: true, force: true });
     console.log(
-      `✓ ${entries.length} GLB exports passed validation in both edge modes (${options.api})`,
+      `✓ ${entries.length} GLB exports passed validation in both edge modes (${backend} backend)`,
     );
     return;
   }

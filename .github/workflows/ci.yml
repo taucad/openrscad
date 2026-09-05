@@ -382,3 +382,13 @@ jobs:
 
       - name: Run openrscad-wasm tests in headless Chrome
         run: wasm-pack test --headless --chrome crates/openrscad-wasm
+
+  # Build the N-API addon for all five published targets, assemble and gate one
+  # frozen release tree, and prove per target that the addon's artifacts are
+  # byte-identical to the WebAssembly build's. The called workflow publishes
+  # nothing and holds no `id-token: write`, so this runs on every pull request
+  # and dispatch as evidence only (napi-architecture-policy §6).
+  native:
+    uses: ./.github/workflows/native.yml
+    permissions:
+      contents: read

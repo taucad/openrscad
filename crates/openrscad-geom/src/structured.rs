@@ -669,10 +669,10 @@ fn balanced_relation<T>(
     Ok(values.pop())
 }
 
-#[cfg(any(target_arch = "wasm32", test, feature = "rust-relation"))]
+#[cfg(any(test, feature = "rust-relation", not(feature = "cpp-relation")))]
 struct RustRelationKernel;
 
-#[cfg(any(target_arch = "wasm32", test, feature = "rust-relation"))]
+#[cfg(any(test, feature = "rust-relation", not(feature = "cpp-relation")))]
 impl RustRelationKernel {
     fn to_manifold(
         mesh: &RelationMesh,
@@ -728,7 +728,7 @@ impl RustRelationKernel {
     }
 }
 
-#[cfg(any(target_arch = "wasm32", test, feature = "rust-relation"))]
+#[cfg(any(test, feature = "rust-relation", not(feature = "cpp-relation")))]
 impl RelationKernel for RustRelationKernel {
     fn union(&self, meshes: Vec<RelationMesh>, keys: &RunKeys) -> Result<RelationMesh, GeomError> {
         let manifolds = meshes
@@ -785,13 +785,14 @@ impl RelationKernel for RustRelationKernel {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 // Dead under `rust-relation` (the pure-Rust kernel is dispatched instead); the
-// linker drops it and the C++ Manifold static code with it.
+// linker drops it and the C++ Manifold static code with it. Without
+// `cpp-relation` it is not compiled at all and `manifold-csg` is not linked.
 #[cfg_attr(feature = "rust-relation", allow(dead_code))]
 struct NativeRelationKernel;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 #[cfg_attr(feature = "rust-relation", allow(dead_code))]
 impl NativeRelationKernel {
     fn to_manifold(
@@ -835,7 +836,7 @@ impl NativeRelationKernel {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 impl RelationKernel for NativeRelationKernel {
     fn union(&self, meshes: Vec<RelationMesh>, keys: &RunKeys) -> Result<RelationMesh, GeomError> {
         let manifolds = meshes
@@ -1889,7 +1890,7 @@ pub(crate) fn render_structured_rust_cached(
     render_structured_with(node, kernel, &RustRelationKernel, cache, false).map(|result| result.0)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 #[cfg(test)]
 pub(crate) fn render_structured_native_cached(
     node: &Node,
@@ -1905,9 +1906,9 @@ pub fn render_structured_cached_diag(
     cache: &mut GeomCache,
     include_backgrounds: bool,
 ) -> Result<(StructuredMesh, super::RenderDiagnostics), GeomError> {
-    #[cfg(any(target_arch = "wasm32", feature = "rust-relation"))]
+    #[cfg(any(feature = "rust-relation", not(feature = "cpp-relation")))]
     let relation = &RustRelationKernel as &dyn RelationKernel;
-    #[cfg(not(any(target_arch = "wasm32", feature = "rust-relation")))]
+    #[cfg(all(feature = "cpp-relation", not(feature = "rust-relation")))]
     let relation = &NativeRelationKernel as &dyn RelationKernel;
     render_structured_with(node, kernel, relation, cache, include_backgrounds)
 }
@@ -2460,7 +2461,7 @@ mod tests {
     /// from Tau drew edges the native CLI never showed. The two still tessellate
     /// booleans at different densities, so the triangle and segment totals differ;
     /// what must not differ is the classification.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cpp-relation")]
     #[test]
     fn both_relation_kernels_classify_a_boolean_into_the_same_patches() {
         use std::collections::BTreeSet;

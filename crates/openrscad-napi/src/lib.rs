@@ -10,8 +10,12 @@
 //! Two properties this addon must keep, because they are what makes it a byte
 //! parity lane rather than a second engine:
 //!
-//! * it links `manifold-rust` only (the `rust-relation` feature), never the C++
-//!   Manifold kernel or TBB — see the `Cargo.toml` note;
+//! * it links `manifold-rust` only — `openrscad-geom`'s `cpp-relation` feature
+//!   is off here, so `manifold-csg` is not even a dependency of this build and
+//!   the C++ Manifold kernel and TBB are never compiled or linked; the
+//!   `rust-relation` feature additionally pins the relation kernel to the
+//!   pure-Rust one so a workspace-wide feature-unified build cannot switch it
+//!   — see the `Cargo.toml` note;
 //! * it never enables `fontdb`'s filesystem features, so `text()` sees exactly
 //!   the fonts a browser would.
 

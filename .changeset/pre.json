@@ -6,8 +6,10 @@
   },
   "changesets": [
     "cli-glb-feature-edges",
+    "engine-cache-hooks",
     "fix-wasm-facade-abi",
     "hull-feature-edge-classification",
+    "native-node-addon",
     "native-structured-3d-export"
   ]
 }

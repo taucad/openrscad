@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.0-beta.4
+
+### Patch Changes
+
+- [#7](https://github.com/taucad/openrscad/pull/7) [`9e855f6`](https://github.com/taucad/openrscad/commit/9e855f688b3f2c2cd2bf491f9a31c7135c911ebb) Thanks [@rifont](https://github.com/rifont)! - Pin npm in the publish workflow instead of installing `npm@latest`, and read `npm pack --json` in both the npm 11 (array) and npm 12 (object) shapes. The `0.11.0-beta.3` publish failed before any package reached the registry because npm 12.0.2 became `latest` that day and changed the output the release-tree validation parses.
+
 ## 0.11.0-beta.3
 
 ### Minor Changes

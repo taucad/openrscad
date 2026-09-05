@@ -237,3 +237,13 @@ describe("binary inspection", () => {
     assert.equal(parsePeHeader("AddressSize: 64bit\n  Machine: IMAGE_FILE_MACHINE_AMD64\n").subsystemVersion, null);
   });
 });
+
+it("singlePackedTarball accepts the npm 11 array and the npm 12 object shapes", async () => {
+  const { singlePackedTarball } = await import("./lib/npm-pack.mjs");
+  const tarball = { filename: "x-1.0.0.tgz", integrity: "sha512-a", name: "x", version: "1.0.0" };
+  assert.deepEqual(singlePackedTarball([tarball], "dir"), tarball);
+  assert.deepEqual(singlePackedTarball({ x: tarball }, "dir"), tarball);
+  for (const bad of [[], [tarball, tarball], {}, { x: tarball, y: tarball }, null, "x"]) {
+    assert.throws(() => singlePackedTarball(bad, "dir"), /exactly one tarball in dir/);
+  }
+});

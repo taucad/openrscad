@@ -180,8 +180,13 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       # Trusted Publishing needs a recent npm.
-      - name: Update npm
-        run: npm install -g npm@latest
+      # Pinned, not `@latest`: Trusted Publishing needs ≥ 11.5.1, and a major
+      # bump changes tool output this job parses — npm 12.0.0 turned
+      # `npm pack --json` from an array into an object, which failed the
+      # 0.11.0-beta.3 publish the day it became `latest`. Bump deliberately, with
+      # `node --test scripts/*.test.mjs` run under the new version.
+      - name: Install the pinned npm
+        run: npm install -g npm@11.19.0
 
       # The SOURCE lockfile, in the source checkout. The prepared manifest is
       # never overlaid here: its optional dependencies do not exist on the

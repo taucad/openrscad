@@ -24,6 +24,13 @@ or Node tool.
   single-digit-millisecond.
 - **Self-contained.** No native dependencies, no threads, no `SharedArrayBuffer`
   — so **no COOP/COEP headers are needed**, even from a CDN.
+- **Native on Node, automatically.** The `node` export condition binds a
+  prebuilt N-API addon when one of the platform packages
+  (`@taulabs/openrscad-engine-{darwin-arm64,darwin-x64,linux-x64-gnu,linux-arm64-gnu,win32-x64-msvc}`,
+  installed as optional dependencies) matches the host, and falls back to the
+  bundled wasm build otherwise. Both are built from one pipeline and held
+  byte-identical by CI; `backend` reports which one bound and `backendCause`
+  keeps the loader's failure chain when it fell back.
 
 > **Heads up — this is a 0.x release.**
 > - The JS API may change between minor versions. **Pin a version** (`"@taulabs/openrscad-engine": "~0.1.0"`, not `^0.1.0`) if you depend on it.

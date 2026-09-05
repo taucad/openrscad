@@ -1,8 +1,8 @@
 name: Publish engine to npm
 
-# Publishes the `@taulabs/openrscad-engine` npm package (the wasm build of
-# crates/openrscad-wasm) for an ALREADY-CREATED GitHub Release. The package name
-# is read from packages/npm/package.json, never hardcoded. Two entry points:
+# Publishes `@taulabs/openrscad-engine` and its five generated platform packages
+# for an ALREADY-CREATED GitHub Release. The package name is read from
+# packages/npm/package.json, never hardcoded. Two entry points:
 #
 #   1. changesets (the normal path). changesets.yml dispatches this workflow with
 #      `--ref <tag> -f tag=<tag>` right after it cuts the Release. The
@@ -15,24 +15,31 @@ name: Publish engine to npm
 # Auth is npm Trusted Publishing (OIDC) — there is NO NPM_TOKEN. npm's trusted
 # publisher config matches org + repo + WORKFLOW FILENAME only; it has no event,
 # branch or ref field, so publishing under workflow_dispatch is fully supported
-# and the registration below is unchanged. On a public repo, provenance (a
-# sigstore attestation shown on the npm page) is emitted automatically.
+# and the registration below is unchanged. Because a dispatch may name any ref,
+# the `release` job below additionally refuses a tag whose commit is not
+# reachable from origin/main. On a public repo, provenance (a sigstore
+# attestation shown on the npm page) is emitted automatically.
 #
-# The version is NOT stamped here any more — changesets + scripts/sync-versions.mjs
-# own [workspace.package] version and packages/npm/package.json, so the tagged
-# commit already carries the right version (this is also what makes the wasm's
-# version() truthful, since it compiles in CARGO_PKG_VERSION). The step below
-# only ASSERTS tag and tree agree.
+# The version is NOT stamped here — changesets + scripts/sync-versions.mjs own
+# [workspace.package] version and packages/npm/package.json, so the tagged commit
+# already carries the right version (this is also what makes the wasm's version()
+# truthful, since it compiles in CARGO_PKG_VERSION). The `release` job only
+# ASSERTS tag and tree agree.
 #
-# BOOTSTRAP (this fork): DONE. @taulabs/openrscad-engine@0.11.0-beta.0 was
-# published by hand so the package would exist, and the trusted publisher is
-# registered — npmjs.com > @taulabs/openrscad-engine > Settings > Trusted
-# Publisher > GitHub Actions, with Organization or user = taucad, Repository =
-# openrscad, Workflow filename = publish-npm.yml, Environment blank, Allowed
-# actions = npm publish. Those fields are case-sensitive and exact, and renaming
-# this file breaks the match. `publishConfig.provenance` is back on, so every
-# release from here carries a sigstore attestation; that only works from CI, so
-# a publish from a laptop now fails by design.
+# The release itself is now a coordinated multi-package publication. `native.yml`
+# builds all five targets, assembles ONE prepared tree, gates it and freezes it as
+# a digested archive; `publish` extracts that exact archive and publishes the five
+# platform packages before the root, because a root whose optional dependencies do
+# not exist yet is uninstallable (napi-architecture-policy §5, §6). Nothing is
+# rebuilt after the freeze, and only `publish` holds `id-token: write`.
+#
+# BOOTSTRAP (this fork): the root's trusted publisher is registered —
+# npmjs.com > @taulabs/openrscad-engine > Settings > Trusted Publisher > GitHub
+# Actions, with Organization or user = taucad, Repository = openrscad, Workflow
+# filename = publish-npm.yml, Environment blank, Allowed actions = npm publish.
+# Those fields are case-sensitive and exact, and renaming this file breaks the
+# match. Each of the five `@taulabs/openrscad-engine-<suffix>` names needs the
+# same registration against this same filename before its first release.
 
 on:
   release:
@@ -45,11 +52,15 @@ on:
         type: string
 
 permissions:
-  contents: write # upload the packed .tgz as a release asset
-  id-token: write # OIDC for Trusted Publishing + provenance
+  contents: read
+
+# Belt and braces: serialize any two runs targeting the same tag.
+concurrency:
+  group: release-npm-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
     # Ignore bot-authored release events: a changesets-cut Release reaches this
     # workflow via dispatch. If an App/PAT token is ever put on changesets.yml its
@@ -59,19 +70,11 @@ jobs:
     if: >-
       github.event_name != 'release' ||
       github.event.release.author.login != 'github-actions[bot]'
-    # Belt and braces: serialize any two runs targeting the same tag.
-    concurrency:
-      group: release-npm-${{ github.event.release.tag_name || inputs.tag }}
-      cancel-in-progress: false
+    outputs:
+      npmtag: ${{ steps.ver.outputs.npmtag }}
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          # Build the TAGGED commit on both triggers. On workflow_dispatch the
-          # default ref is the branch you dispatched from, so pin it explicitly —
-          # otherwise provenance would attest a build that isn't the tag.
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
-          submodules: false
-
       - name: Resolve version + dist-tag from the release tag
         id: ver
         shell: bash
@@ -82,9 +85,13 @@ jobs:
             echo "::error::Release tag '$TAG' is not a valid vX.Y.Z semver tag."
             exit 1
           fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          # A prerelease tag (0.2.0-rc.1) publishes under `next` so it never
-          # clobbers the `latest` dist-tag that plain `npm install` resolves.
+          # A prerelease tag (0.11.0-beta.3) publishes under `next` so it never
+          # clobbers the `latest` dist-tag that plain `npm install` resolves. This
+          # is also why the publish job exports NPM_CONFIG_TAG: `napi pre-publish`
+          # spawns a bare `npm publish` per platform, with no --tag of its own,
+          # and would otherwise send every platform package to `latest`.
           # Matched with `case`, not `grep -q '-'`: a lone `-` is not reliably
           # parsed as a pattern, which silently sends prereleases to `latest`.
           case "$V" in
@@ -92,34 +99,29 @@ jobs:
             *)   echo "npmtag=latest" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - name: Install Rust (wasm target)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
         with:
-          targets: wasm32-unknown-unknown
+          # Build the TAGGED commit on both triggers. On workflow_dispatch the
+          # default ref is the branch you dispatched from, so pin it explicitly —
+          # otherwise provenance would attest a build that isn't the tag.
+          ref: ${{ steps.ver.outputs.tag }}
+          fetch-depth: 0
+          submodules: false
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-wasm-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Install wasm-pack
+      # npm's trusted-publisher match has no ref field, so a dispatch from a
+      # stray tag would otherwise be publishable. Publication derives from the
+      # default branch as well as the tag (policy §6).
+      - name: Assert the tag is reachable from origin/main
+        shell: bash
         run: |
-          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      # Trusted Publishing needs a recent npm.
-      - name: Update npm
-        run: npm install -g npm@latest
+          set -euo pipefail
+          git fetch --no-tags origin main
+          SHA="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$SHA" origin/main; then
+            echo "::error::${{ steps.ver.outputs.tag }} ($SHA) is not reachable from origin/main; nothing off the default branch may publish."
+            exit 1
+          fi
+          echo "$SHA is on origin/main."
 
       # changesets owns the versions, so the tagged commit already carries them —
       # no stamping. Assert instead: the wasm compiles CARGO_PKG_VERSION into
@@ -142,62 +144,188 @@ jobs:
           fi
           echo "Cargo.toml and packages/npm/package.json both report $V."
 
-      - name: Build wasm targets (web + node) and the TS facade
-        working-directory: packages/npm
-        shell: bash
-        run: |
-          wasm-pack build ../../crates/openrscad-wasm --release --target web \
-            --out-dir "$PWD/pkg/web" --out-name openrscad
-          wasm-pack build ../../crates/openrscad-wasm --release --target nodejs \
-            --out-dir "$PWD/pkg/node" --out-name openrscad
-          # wasm-pack writes a `.gitignore` containing `*` into each out-dir;
-          # npm honors it and would silently drop the wasm from the tarball.
-          rm -f pkg/web/.gitignore pkg/node/.gitignore
-          npm install
-          npm run build:facade
+  # Build every target, assemble the single prepared tree, gate it, freeze it and
+  # prove byte parity per target. Retained thirty days: npm publication is not
+  # transactional, and a partial release is recovered by re-running `publish`
+  # against these exact bytes (policy §7).
+  native:
+    needs: release
+    uses: ./.github/workflows/native.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ needs.release.outputs.tag }}
+      retention-days: 30
 
-      # No `npm version` step: changesets already wrote the version into
-      # package.json, and the assertion above proved it matches the tag.
+  publish:
+    needs: [release, native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for Trusted Publishing + provenance
+    env:
+      # `napi pre-publish` spawns a bare `npm publish` per platform: no --tag, no
+      # --access, no --provenance. Configuration is the only way to reach it.
+      NPM_CONFIG_PROVENANCE: 'true'
+      NPM_CONFIG_TAG: ${{ needs.release.outputs.npmtag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          submodules: false
 
-      - name: Publish to npm (idempotent)
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted Publishing needs a recent npm.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      # The SOURCE lockfile, in the source checkout. The prepared manifest is
+      # never overlaid here: its optional dependencies do not exist on the
+      # registry yet, so installing against it would fail (policy §6).
+      - name: Install engine package dependencies
         working-directory: packages/npm
-        shell: bash
+        run: npm ci
+
+      - uses: ./.github/actions/download-verified-artifact
+        with:
+          name: prepared-release
+          path: prepared-release
+          expect: ${{ needs.native.outputs.archive }} ${{ needs.native.outputs.archive }}.sha256
+
+      - name: Verify the digest and extract the frozen release tree
+        env:
+          ARCHIVE: ${{ needs.native.outputs.archive }}
         run: |
-          V="${{ steps.ver.outputs.version }}"
-          # Read the name rather than hardcoding it: this fork publishes under a
-          # scope, and a stale literal here would check the wrong package and
-          # publish over the top of a green "already published" log line.
-          NAME=$(node -p "require('./package.json').name")
-          if npm view "$NAME@$V" version >/dev/null 2>&1; then
-            echo "$NAME@$V already on the registry — skipping publish."
+          set -euo pipefail
+          (cd prepared-release && sha256sum --check "$ARCHIVE.sha256")
+          mkdir -p release
+          tar -xzf "prepared-release/$ARCHIVE" -C release
+
+      - name: Validate the frozen release tree
+        run: node scripts/validate-pack.mjs --root release
+
+      # Platforms first, serially, through NAPI-RS. It also updates the prepared
+      # root manifest; it never publishes the root itself.
+      - name: Publish the five platform packages
+        working-directory: packages/npm
+        run: npx napi pre-publish --cwd "$GITHUB_WORKSPACE/release" -t npm --no-gh-release
+
+      # Root last, and only once every platform attempt has completed. The guard
+      # is the small exact-version retry guard policy §6 permits: it decides
+      # whether root already exists and nothing else.
+      - name: Publish the root package
+        env:
+          NPMTAG: ${{ needs.release.outputs.npmtag }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME=$(node -p "require('./release/package.json').name")
+          if [ "$(npm view "$NAME@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
+            echo "$NAME@$VERSION is already on the registry — skipping the root publish."
             exit 0
           fi
-          # The check above is inherently racy (two runs can both pass it), so
-          # treat "someone else published it first" as success rather than a
-          # spurious red E403.
-          npm publish --tag "${{ steps.ver.outputs.npmtag }}" || {
-            if npm view "$NAME@$V" version >/dev/null 2>&1; then
-              echo "Lost a publish race; $NAME@$V is present. Treating as success."
-            else
-              echo "::error::npm publish failed and $NAME@$V is not on the registry."
-              exit 1
-            fi
-          }
+          if ! output="$(npm publish ./release --access public --provenance --tag "$NPMTAG" 2>&1)"; then
+            echo "$output"
+            grep --quiet 'cannot publish over the previously published versions' <<<"$output" || exit 1
+            echo "$NAME@$VERSION was already published; treating as success."
+            exit 0
+          fi
+          echo "$output"
 
-      - name: Smoke-check provenance
-        working-directory: packages/npm
-        continue-on-error: true
-        run: npm audit signatures || true
+  # Prove what the registry serves, not what this tree built. This job installs
+  # no repository dependency on purpose, and every script it runs imports only
+  # Node builtins and repository files (policy §10).
+  registry-verify:
+    needs: [release, native, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          submodules: false
 
-      - name: Attach packed tarball to the release
-        shell: bash
+      - uses: ./.github/actions/download-verified-artifact
+        with:
+          name: test-tarballs
+          path: tarballs
+          expect: test-tarballs.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # npm scans at publish time, so a successful publish is invisible for
+      # minutes. Bounded backoff, and an integrity that disagrees with the tested
+      # bytes fails immediately rather than being retried.
+      - name: Wait for the registry to serve every published package
+        run: node scripts/registry-wait.mjs --tarballs tarballs/test-tarballs.json --interval-seconds 30 --timeout-minutes 30
+
+      - name: Force-install every package and verify its attestations
+        run: |
+          set -euo pipefail
+          node -e "const m=require('./tarballs/test-tarballs.json');process.stdout.write(Object.keys(m.packages).sort().map((n)=>n+'@'+m.version).join(' '))" > /tmp/specifiers
+          directory="$(mktemp -d)"
+          cd "$directory"
+          npm init --yes >/dev/null
+          xargs npm install --force --ignore-scripts < /tmp/specifiers
+          npm audit signatures --include-attestations
+
+      # A prerelease must never be reachable by a bare `npm install`, for the
+      # root or for any platform package (blueprint F7).
+      - name: Assert the dist-tags the release actually assigned
+        env:
+          NPMTAG: ${{ needs.release.outputs.npmtag }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e "
+            const { execFileSync } = require('node:child_process');
+            const { packages, version } = require('./tarballs/test-tarballs.json');
+            const wanted = process.env.NPMTAG;
+            const failures = [];
+            for (const name of Object.keys(packages).sort()) {
+              const tags = JSON.parse(execFileSync('npm', ['view', name, 'dist-tags', '--json'], { encoding: 'utf8' }));
+              if (tags[wanted] !== version) failures.push(name + ': ' + wanted + ' is ' + String(tags[wanted]) + ', expected ' + version);
+              if (wanted !== 'latest' && tags.latest === version) failures.push(name + ': latest points at the prerelease ' + version);
+            }
+            if (failures.length) { console.error(failures.join('\n')); process.exit(1); }
+            console.log('dist-tags correct for ' + Object.keys(packages).length + ' packages at ' + version);
+          "
+
+  # Release assets only after the registry verified: the tarballs attached here
+  # are the exact frozen bytes the registry now serves.
+  release-assets:
+    needs: [release, native, registry-verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          submodules: false
+
+      - uses: ./.github/actions/download-verified-artifact
+        with:
+          name: test-tarballs
+          path: tarballs
+          expect: test-tarballs.json
+
+      - name: Attach the published tarballs to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
         run: |
-          cd packages/npm
-          TGZ=$(npm pack 2>/dev/null | tail -n1)
-          # Stable-named alias so a static link (releases/latest/download/...) always
-          # resolves to the newest engine tarball, matching the desktop convention.
-          cp "$TGZ" openrscad-engine.tgz
-          gh release upload "${{ github.event.release.tag_name || inputs.tag }}" \
-            "$TGZ" openrscad-engine.tgz --clobber --repo "$GITHUB_REPOSITORY"
+          set -euo pipefail
+          cd tarballs
+          ROOT=$(node -e "const m=require('./test-tarballs.json');process.stdout.write(m.packages['@taulabs/openrscad-engine'].filename)")
+          # Stable-named alias so a static link (releases/latest/download/...)
+          # always resolves to the newest engine tarball.
+          cp "$ROOT" openrscad-engine.tgz
+          gh release upload "$TAG" ./*.tgz --clobber --repo "$GITHUB_REPOSITORY"

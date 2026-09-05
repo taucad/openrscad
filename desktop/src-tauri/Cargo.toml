@@ -38,7 +38,9 @@ notify = "6"
 
 openrscad-syntax = { path = "../../crates/openrscad-syntax" }
 openrscad-eval = { path = "../../crates/openrscad-eval", features = ["system-fonts"] }
-openrscad-geom = { path = "../../crates/openrscad-geom" }
+# `cpp-relation` links the C++ Manifold kernel (`ManifoldKernel`), which the app
+# uses for native renders; it needs cmake and a C++ toolchain at build time.
+openrscad-geom = { path = "../../crates/openrscad-geom", features = ["cpp-relation"] }
 
 [profile.release]
 opt-level = 3

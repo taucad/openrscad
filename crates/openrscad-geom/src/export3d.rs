@@ -1913,7 +1913,7 @@ mod tests {
         assert_eq!(line_segment_count(&document), 32);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cpp-relation")]
     #[test]
     fn rust_and_native_relations_preserve_the_same_boolean_feature_edges() {
         use crate::{render_structured_native_cached, ManifoldKernel};
@@ -1947,7 +1947,7 @@ mod tests {
         assert_eq!(native_lines, rust_lines);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cpp-relation")]
     #[test]
     fn rust_and_native_relations_preserve_source_patch_boundaries() {
         use crate::{render_structured_native_cached, ManifoldKernel};
@@ -2064,7 +2064,7 @@ mod tests {
     /// A hull face lying wholly on one operand inherits that operand's surface,
     /// so the boundary with anything that later cuts it is a patch pair and is
     /// drawn along its whole length rather than eroding toward tangency.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cpp-relation")]
     #[test]
     fn hull_faces_inherit_their_operand_surface() {
         use crate::{render_structured_native_cached, ManifoldKernel};
@@ -2225,7 +2225,7 @@ mod tests {
     /// shows. The two hull *differently* (different triangle counts, and the
     /// cap disks get chopped into a different number of patch islands), so the
     /// patch census cannot match; the segments they draw must.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cpp-relation")]
     #[test]
     fn both_relation_kernels_draw_the_same_hull_feature_edges() {
         use crate::{render_structured_native_cached, ManifoldKernel};

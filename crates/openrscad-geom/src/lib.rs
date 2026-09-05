@@ -17,12 +17,12 @@ pub(crate) use export3d::{
 pub use export3d::{
     export_3d, CoordinateSystem, Export3DArtifact, Export3DOptions, ExportFormat3D,
 };
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 pub use kernel::ManifoldKernel;
 pub use kernel::{BoolmeshKernel, Kernel, RustManifoldKernel};
 pub use mesh::Mesh;
 pub use shape2d::Contour;
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(all(test, feature = "cpp-relation"))]
 pub(crate) use structured::render_structured_native_cached;
 pub use structured::{render_structured_cached_diag, StructuredMesh};
 #[cfg(test)]
@@ -40,9 +40,9 @@ pub use vector2d::{export_dxf, export_svg, import_dxf, import_svg};
 /// cannot surface geometry errors; first-party callers should prefer
 /// [`render_contours_with`].
 pub fn render_contours(node: &Node) -> Option<Vec<Contour>> {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cpp-relation")]
     let kernel = ManifoldKernel::new();
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(not(feature = "cpp-relation"))]
     let kernel = RustManifoldKernel::new();
     render_contours_with(node, &kernel).ok().flatten()
 }
@@ -215,15 +215,15 @@ struct Ctx<'a> {
 }
 
 /// Render a CSG tree to a mesh using the default kernel for the target:
-/// C++ Manifold on native, pure-Rust Manifold on wasm.
-#[cfg(not(target_arch = "wasm32"))]
+/// C++ Manifold under `cpp-relation`, the pure-Rust port otherwise.
+#[cfg(feature = "cpp-relation")]
 pub fn render(node: &Node) -> Result<Mesh, GeomError> {
     render_with(node, &ManifoldKernel::new())
 }
 
 /// Render a CSG tree to a mesh using the default kernel for the target:
-/// C++ Manifold on native, pure-Rust Manifold on wasm.
-#[cfg(target_arch = "wasm32")]
+/// C++ Manifold under `cpp-relation`, the pure-Rust port otherwise.
+#[cfg(not(feature = "cpp-relation"))]
 pub fn render(node: &Node) -> Result<Mesh, GeomError> {
     render_with(node, &RustManifoldKernel::new())
 }
@@ -237,14 +237,14 @@ pub fn render_with(node: &Node, kernel: &dyn Kernel) -> Result<Mesh, GeomError> 
 /// Render colored preview groups using the default kernel (no persistent cache).
 /// The fused [`render`] stays the source of truth for stats/export; this is the
 /// preview/`color`-aware view (and the basis for colored 3MF export).
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 pub fn render_groups(node: &Node) -> Result<Vec<ColoredMesh>, GeomError> {
     let mut cache = GeomCache::new();
     render_groups_cached(node, &ManifoldKernel::new(), &mut cache)
 }
 
-/// See [`render_groups`]. wasm target uses the pure-Rust kernel.
-#[cfg(target_arch = "wasm32")]
+/// See [`render_groups`]. Without `cpp-relation` the pure-Rust kernel is used.
+#[cfg(not(feature = "cpp-relation"))]
 pub fn render_groups(node: &Node) -> Result<Vec<ColoredMesh>, GeomError> {
     let mut cache = GeomCache::new();
     render_groups_cached(node, &RustManifoldKernel::new(), &mut cache)
@@ -559,14 +559,14 @@ pub fn preview_channel(groups: &[ColoredMesh]) -> (Vec<f32>, Vec<f32>, String) {
 
 /// Render per-statement provenance groups using the default kernel (no persistent
 /// cache). See [`render_provenance_cached`].
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 pub fn render_provenance(node: &Node) -> Result<Vec<TaggedMesh>, GeomError> {
     let mut cache = GeomCache::new();
     render_provenance_cached(node, &ManifoldKernel::new(), &mut cache)
 }
 
-/// See [`render_provenance`]. wasm target uses the pure-Rust kernel.
-#[cfg(target_arch = "wasm32")]
+/// See [`render_provenance`]. Without `cpp-relation` the pure-Rust kernel is used.
+#[cfg(not(feature = "cpp-relation"))]
 pub fn render_provenance(node: &Node) -> Result<Vec<TaggedMesh>, GeomError> {
     let mut cache = GeomCache::new();
     render_provenance_cached(node, &RustManifoldKernel::new(), &mut cache)
@@ -2208,7 +2208,7 @@ mod tests {
             Node::Sphere { r: 2.0, frags },
         ]);
         let (_, warns) =
-            render_cached_warns(&node, &ManifoldKernel::new(), &mut GeomCache::new()).unwrap();
+            render_cached_warns(&node, &RustManifoldKernel::new(), &mut GeomCache::new()).unwrap();
         assert!(
             warns.is_empty(),
             "convex minkowski should not warn: {warns:?}"
@@ -2239,7 +2239,7 @@ mod tests {
             },
         ]);
         let (mesh, warns) =
-            render_cached_warns(&node, &ManifoldKernel::new(), &mut GeomCache::new()).unwrap();
+            render_cached_warns(&node, &RustManifoldKernel::new(), &mut GeomCache::new()).unwrap();
         assert!(
             warns.is_empty(),
             "union of convex parts is exact: {warns:?}"
@@ -2282,7 +2282,7 @@ mod tests {
             },
         ]);
         let (_, warns) =
-            render_cached_warns(&node, &ManifoldKernel::new(), &mut GeomCache::new()).unwrap();
+            render_cached_warns(&node, &RustManifoldKernel::new(), &mut GeomCache::new()).unwrap();
         assert!(
             warns.iter().any(|w| w.contains("non-convex")),
             "expected non-convex warning for a concave leaf, got {warns:?}"
@@ -2628,7 +2628,7 @@ mod tests {
             .all(|id| { structured.attributions[id.0 as usize].rgba == [1.0, 0.0, 0.0, 1.0] }));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cpp-relation")]
     #[test]
     fn structured_rust_and_native_backends_agree_on_relation_classification() {
         let node = Node::Union(vec![
@@ -2727,7 +2727,7 @@ mod tests {
     /// Bake-off: the pure-Rust Manifold kernel must agree with the C++ Manifold
     /// kernel to within tolerance on a mixed union/difference/intersection model.
     #[test]
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "cpp-relation")]
     fn kernels_agree() {
         let frags = FragmentSpec {
             fn_: 48.0,

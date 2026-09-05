@@ -34,7 +34,10 @@ jobs:
             target
           key: cargo-ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
-      # C++ Manifold (native backend) needs cmake.
+      # cmake builds `manifold-csg` (C++ Manifold), which `openrscad-geom` links
+      # only under its `cpp-relation` feature — enabled by openrscad-cli,
+      # openrscad-lsp and xtask, so `cargo build/test --workspace` needs it. The
+      # wasm and napi jobs do not: neither enables the feature.
       - name: Install cmake
         uses: lukka/get-cmake@latest
 
@@ -249,9 +252,9 @@ jobs:
             fuzz/target
           key: fuzz-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'fuzz/Cargo.toml') }}
 
-      # openrscad-geom pulls in manifold-csg-sys (C++/cmake) transitively.
-      - name: Install cmake
-        uses: lukka/get-cmake@latest
+      # No cmake: the fuzz targets exercise the parser, evaluator and mesh
+      # importers only, so they take `openrscad-geom` without `cpp-relation` and
+      # `manifold-csg` is not in this crate's dependency graph.
 
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2

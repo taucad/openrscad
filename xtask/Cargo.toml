@@ -8,4 +8,6 @@ publish = false
 [dependencies]
 openrscad-syntax = { workspace = true }
 openrscad-eval = { workspace = true }
-openrscad-geom = { workspace = true }
+# `cpp-relation` links the C++ Manifold kernel (`ManifoldKernel`), which this
+# crate names directly; it needs cmake and a C++ toolchain at build time.
+openrscad-geom = { workspace = true, features = ["cpp-relation"] }

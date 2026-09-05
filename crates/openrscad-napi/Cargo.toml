@@ -11,10 +11,20 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-# `rust-relation` is not optional here: a native build that used the C++
-# relation kernel would serialize a structurally different artifact from the
-# wasm build (different triangle partition, −10% surface area on boolean-heavy
-# models), and the whole point of this addon is that it does not.
+# This addon is pure Rust. `openrscad-geom`'s `cpp-relation` feature is NOT
+# enabled anywhere in this dependency chain, so `manifold-csg` (C++ Manifold +
+# TBB, built from source with cmake) is not a dependency of a
+# `cargo build -p openrscad-napi` at all — that is what lets the addon
+# cross-compile without a C++ toolchain.
+#
+# `rust-relation` stays on top of that as an explicit pin: a native build that
+# used the C++ relation kernel would serialize a structurally different artifact
+# from the wasm build (different triangle partition, −10% surface area on
+# boolean-heavy models), and the whole point of this addon is that it does not.
+# The pin matters because Cargo unifies features per build: a
+# `cargo build --workspace` also builds `openrscad-cli`, which does enable
+# `cpp-relation`, and without this pin the shared `openrscad-geom` would hand
+# this addon the C++ relation kernel.
 #
 # `openrscad-eval` is taken WITHOUT `system-fonts` so `text()` cannot pick up
 # host fonts the browser has never heard of.

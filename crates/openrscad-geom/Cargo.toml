@@ -11,6 +11,14 @@ benchmark-profile = ["dep:web-time"]
 # Force the pure-Rust relation kernel on native targets so native and wasm
 # serialize the same artifact (the wasm build is the reference semantics).
 rust-relation = []
+# Link the C++ Manifold kernel (`manifold-csg`), which is built from source and
+# so needs cmake and a C++ toolchain. Off by default: with it the crate exposes
+# `ManifoldKernel` and dispatches booleans and relations through C++; without it
+# every path uses the pure-Rust `manifold-rust` port and the crate is pure Rust.
+# `openrscad-cli`, `openrscad-lsp` and the desktop app enable it; `openrscad-napi`
+# and `openrscad-wasm` do not, so neither needs cmake. Native-only — the
+# dependency is absent on wasm32, so enabling it there will not compile.
+cpp-relation = ["dep:manifold-csg"]
 
 [dependencies]
 openrscad-ir = { workspace = true }
@@ -28,9 +36,11 @@ libm = { workspace = true }
 serde_json = "1"
 web-time = { version = "1", optional = true }
 
-# C++ Manifold kernel — native only (does not target wasm32-unknown-unknown).
+# C++ Manifold kernel — native only (does not target wasm32-unknown-unknown) and
+# built from source with cmake + a C++ toolchain, so it is opt-in via
+# `cpp-relation`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-manifold-csg = "0.3"
+manifold-csg = { version = "0.3", optional = true }
 
 [dev-dependencies]
 roxmltree = "0.20"

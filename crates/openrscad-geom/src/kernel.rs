@@ -3,13 +3,14 @@
 //! The kernel bake-off (per the plan) is realized as two backends behind one
 //! trait:
 //!
-//! * [`ManifoldKernel`] — the C++ Manifold library via `manifold-csg`. Native
-//!   only; battle-tested and fast, but does not target
-//!   `wasm32-unknown-unknown`.
+//! * [`ManifoldKernel`] — the C++ Manifold library via `manifold-csg`. Behind
+//!   the `cpp-relation` feature: it is native-only (no `wasm32-unknown-unknown`
+//!   target) and is built from source, so it needs cmake and a C++ toolchain.
+//!   Battle-tested and fast.
 //! * [`RustManifoldKernel`] — the pure-Rust port of Manifold. Builds
 //!   everywhere, including wasm, and is the default backend in the browser.
 //!
-//! Both are differential-tested against each other on native builds.
+//! Both are differential-tested against each other whenever `cpp-relation` is on.
 
 use crate::mesh::Mesh;
 use crate::GeomError;
@@ -186,10 +187,10 @@ impl Kernel for RustManifoldKernel {
 // C++ backend: manifold-csg (native only)
 // ===================================================================
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 pub use manifold_backend::ManifoldKernel;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(feature = "cpp-relation")]
 mod manifold_backend {
     use super::*;
     use manifold_csg::{Manifold, MeshGL64};

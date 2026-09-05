@@ -28,6 +28,32 @@ pub fn clear_cache() {
     openrscad_api::clear_cache();
 }
 
+/// Serialize the geometry-cache entries added at or after `since_epoch`
+/// (`0` = everything) as an opaque, versioned blob for the host to persist.
+#[wasm_bindgen]
+pub fn cache_export(since_epoch: u32) -> Vec<u8> {
+    openrscad_api::cache_export(u64::from(since_epoch))
+}
+
+/// Rehydrate entries from a `cache_export` blob of the same engine version and
+/// kernel. Returns a JSON report; throws on a foreign or malformed blob.
+#[wasm_bindgen]
+pub fn cache_import(bytes: &[u8]) -> Result<String, JsError> {
+    openrscad_api::cache_import(bytes).map_err(|error| JsError::new(&error))
+}
+
+/// Resident-cache accounting, caps and envelope as JSON.
+#[wasm_bindgen]
+pub fn cache_stats() -> String {
+    openrscad_api::cache_stats()
+}
+
+/// Every resident structural key, ascending, as a `BigUint64Array`.
+#[wasm_bindgen]
+pub fn cache_keys() -> Vec<u64> {
+    openrscad_api::cache_keys()
+}
+
 /// Engine version string.
 #[wasm_bindgen]
 pub fn version() -> String {

@@ -2,8 +2,10 @@
 //!
 //! The exported surface is deliberately **the same shape as the wasm-bindgen
 //! surface** — same function names, same parallel-array arguments, same result
-//! classes with `take_bytes()`/`free()` — so `packages/npm-native` can feed it
-//! straight into `makeApi()`, the one JS facade both engines share. No pipeline
+//! classes with `take_bytes()`/`free()` — so `packages/npm`'s Node entry can
+//! feed it straight into `makeApi()`, the one JS facade both engines share
+//! (`@taulabs/openrscad-engine` ships this addon and the wasm build in one
+//! package, selected by the `node` export condition). No pipeline
 //! logic lives here: everything below is a conversion into
 //! [`openrscad_api::Request`] and back.
 //!
@@ -502,4 +504,30 @@ pub fn version() -> String {
 #[napi(js_name = "clear_cache")]
 pub fn clear_cache() {
     openrscad_api::clear_cache();
+}
+
+/// Serialize the geometry-cache entries added at or after `since_epoch`
+/// (`0` = everything) as an opaque, versioned blob for the host to persist.
+#[napi(js_name = "cache_export")]
+pub fn cache_export(since_epoch: u32) -> Buffer {
+    openrscad_api::cache_export(u64::from(since_epoch)).into()
+}
+
+/// Rehydrate entries from a `cache_export` blob of the same engine version and
+/// kernel. Returns a JSON report; throws on a foreign or malformed blob.
+#[napi(js_name = "cache_import")]
+pub fn cache_import(bytes: Uint8Array) -> Result<String> {
+    openrscad_api::cache_import(&bytes).map_err(Error::from_reason)
+}
+
+/// Resident-cache accounting, caps and envelope as JSON.
+#[napi(js_name = "cache_stats")]
+pub fn cache_stats() -> String {
+    openrscad_api::cache_stats()
+}
+
+/// Every resident structural key, ascending, as a `BigUint64Array`.
+#[napi(js_name = "cache_keys")]
+pub fn cache_keys() -> BigUint64Array {
+    BigUint64Array::new(openrscad_api::cache_keys())
 }

@@ -65,6 +65,7 @@
   ],
   "files": [
     "dist",
+    "!dist/native/*.node",
     "pkg/web",
     "pkg/node",
     "examples",
@@ -72,21 +73,37 @@
     "LICENSE-APACHE",
     "LICENSE-MIT"
   ],
+  "engines": {
+    "node": ">=20"
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true
   },
   "scripts": {
-    "build": "npm run build:wasm && npm run build:facade",
+    "build": "npm run build:wasm && npm run build:addon && npm run build:facade",
     "build:wasm": "wasm-pack build ../../crates/openrscad-wasm --release --target web --out-dir \"$PWD/pkg/web\" --out-name openrscad && wasm-pack build ../../crates/openrscad-wasm --release --target nodejs --out-dir \"$PWD/pkg/node\" --out-name openrscad && rm -f pkg/web/.gitignore pkg/node/.gitignore",
     "build:wasm:profile": "wasm-pack build ../../crates/openrscad-wasm --release --target web --out-dir \"$PWD/pkg/web\" --out-name openrscad -- --features benchmark-profile && wasm-pack build ../../crates/openrscad-wasm --release --target nodejs --out-dir \"$PWD/pkg/node\" --out-name openrscad -- --features benchmark-profile && rm -f pkg/web/.gitignore pkg/node/.gitignore",
-    "build:facade": "tsc -p tsconfig.json",
+    "build:addon": "napi build --platform --release --esm --js index.js --dts index.d.ts --output-dir ./src/native --manifest-path ../../crates/openrscad-napi/Cargo.toml",
+    "build:facade": "tsc -p tsconfig.json && node scripts/copy-native.mjs",
     "test": "npm run build:facade && node --test test/*.test.mjs"
   },
   "devDependencies": {
+    "@napi-rs/cli": "3.8.6",
     "typescript": "^5.5.3"
   },
   "contributors": [
     "Richard Fontein (Tau)"
-  ]
+  ],
+  "napi": {
+    "binaryName": "openrscad",
+    "packageName": "@taulabs/openrscad-engine",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
+    ]
+  }
 }

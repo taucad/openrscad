@@ -14,6 +14,11 @@ web/engine/
 # openrscad-engine npm package build output (regenerate with `npm run build` in packages/npm)
 packages/npm/pkg/
 packages/npm/*.tgz
+# NAPI-RS build output: the generated loader, its declarations and the addon
+# (regenerate with `npm run build:addon` in packages/npm). `napi artifacts`
+# also drops suffixed `.node` files in the package root during release assembly.
+packages/npm/src/native/
+packages/npm/*.node
 
 # TypeScript incremental build info
 *.tsbuildinfo

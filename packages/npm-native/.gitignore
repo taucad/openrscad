@@ -1,4 +1,0 @@
-# NAPI-RS build output: the generated loader, declarations and the addon.
-src/native/
-dist/
-node_modules/

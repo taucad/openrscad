@@ -32,6 +32,10 @@ async function loadWasm(): Promise<RawEngine> {
     parameters: glue.parameters,
     version: glue.version,
     clear_cache: glue.clear_cache,
+    cache_export: glue.cache_export,
+    cache_import: glue.cache_import,
+    cache_stats: glue.cache_stats,
+    cache_keys: glue.cache_keys,
   } as unknown as RawEngine;
 }
 
@@ -64,9 +68,15 @@ export const exportShape3D = api.exportShape3D;
 export const parameters = api.parameters;
 export const version = api.version;
 export const clearCache = api.clearCache;
+export const exportCache = api.exportCache;
+export const importCache = api.importCache;
+export const cacheStats = api.cacheStats;
+export const cacheKeys = api.cacheKeys;
 
 export type {
   Backend,
+  CacheImportReport,
+  CacheStats,
   Diagnostic,
   ExportGlbOptions,
   ExportShape3DFormat,

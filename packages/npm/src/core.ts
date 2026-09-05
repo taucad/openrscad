@@ -219,6 +219,37 @@ export interface RawEngine {
   parameters(source: string): string;
   version(): string;
   clear_cache(): void;
+  cache_export(sinceEpoch: number): Uint8Array;
+  cache_import(bytes: Uint8Array): string;
+  cache_stats(): string;
+  cache_keys(): BigUint64Array;
+}
+
+/** Outcome of `importCache`. */
+export interface CacheImportReport {
+  /** Entries added. */
+  imported: number;
+  /** Entries whose key was already resident (kept as-is). */
+  skipped: number;
+  /** Resident entries after the import. */
+  entries: number;
+  /** Resident mesh payload bytes after the import. */
+  bytes: number;
+}
+
+/** Resident geometry-cache accounting plus the envelope every exported blob
+ *  carries (a blob is only importable by an engine with the same envelope). */
+export interface CacheStats {
+  entries: number;
+  bytes: number;
+  /** Pass back to `exportCache({ sinceEpoch })` to receive only newer entries. */
+  epoch: number;
+  entryCap: number;
+  byteCap: number;
+  engineVersion: string;
+  kernelId: string;
+  hashAlgo: string;
+  formatVersion: number;
 }
 
 function toLiteral(v: string | number | boolean): string {
@@ -393,5 +424,44 @@ export function makeApi(engine: RawEngine, ensureReady: () => Promise<void>) {
     engine.clear_cache();
   }
 
-  return { render, renderToGlb, exportShape2D, exportShape3D, parameters, version, clearCache };
+  /** Serialize the resident geometry cache as an opaque, versioned blob for the
+   *  host to persist. `sinceEpoch` (from `cacheStats().epoch`, default 0 = all)
+   *  restricts it to entries added since that epoch. */
+  async function exportCache(opts: { sinceEpoch?: number } = {}): Promise<Uint8Array> {
+    await ensureReady();
+    return engine.cache_export(opts.sinceEpoch ?? 0);
+  }
+
+  /** Rehydrate entries from an `exportCache` blob produced by the same engine
+   *  version and kernel. Rejects (throws) foreign or malformed blobs. */
+  async function importCache(bytes: Uint8Array): Promise<CacheImportReport> {
+    await ensureReady();
+    return JSON.parse(engine.cache_import(bytes)) as CacheImportReport;
+  }
+
+  /** Resident-cache accounting and the engine's cache envelope. */
+  async function cacheStats(): Promise<CacheStats> {
+    await ensureReady();
+    return JSON.parse(engine.cache_stats()) as CacheStats;
+  }
+
+  /** Every resident structural key, ascending (parity tooling). */
+  async function cacheKeys(): Promise<BigUint64Array> {
+    await ensureReady();
+    return engine.cache_keys();
+  }
+
+  return {
+    render,
+    renderToGlb,
+    exportShape2D,
+    exportShape3D,
+    parameters,
+    version,
+    clearCache,
+    exportCache,
+    importCache,
+    cacheStats,
+    cacheKeys,
+  };
 }

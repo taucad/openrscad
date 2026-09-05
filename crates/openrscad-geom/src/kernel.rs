@@ -17,6 +17,9 @@ use crate::GeomError;
 
 /// A constructive-solid-geometry kernel over triangle meshes.
 pub trait Kernel {
+    /// Stable identity of the backend, part of every persisted cache blob's
+    /// envelope: meshes from different backends are never interchangeable.
+    fn id(&self) -> &'static str;
     fn union(&self, meshes: Vec<Mesh>) -> Result<Mesh, GeomError>;
     fn difference(&self, base: Mesh, tools: Vec<Mesh>) -> Result<Mesh, GeomError>;
     fn intersection(&self, meshes: Vec<Mesh>) -> Result<Mesh, GeomError>;
@@ -132,6 +135,9 @@ mod rust_manifold {
 }
 
 impl Kernel for RustManifoldKernel {
+    fn id(&self) -> &'static str {
+        "manifold-rust"
+    }
     fn union(&self, meshes: Vec<Mesh>) -> Result<Mesh, GeomError> {
         let mans = meshes
             .iter()
@@ -243,6 +249,9 @@ mod manifold_backend {
     }
 
     impl Kernel for ManifoldKernel {
+        fn id(&self) -> &'static str {
+            "manifold-cpp"
+        }
         fn union(&self, meshes: Vec<Mesh>) -> Result<Mesh, GeomError> {
             let mans = meshes
                 .iter()

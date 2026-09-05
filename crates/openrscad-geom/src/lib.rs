@@ -1,6 +1,7 @@
 //! Geometry: mesh types, the fragment formula + primitive tessellation, the
 //! `Kernel` trait (CSG boolean backend), and the CSG-tree -> mesh renderer.
 
+mod cache_io;
 mod export3d;
 mod hull;
 mod kernel;
@@ -10,6 +11,9 @@ mod structured;
 mod tessellate;
 mod vector2d;
 
+pub use cache_io::{
+    CacheEnvelope, CacheImportError, CacheImportReport, CacheStats, CACHE_FORMAT_VERSION, HASH_ALGO,
+};
 #[cfg(test)]
 pub(crate) use export3d::{
     edge_derivation_count, parse_glb_json, reset_edge_derivation_count, serialize_glb,
@@ -136,6 +140,11 @@ struct CachedNode {
     mesh: Mesh,
     warnings: Vec<String>,
     errors: Vec<String>,
+    /// Export epoch the entry was inserted in (0 = imported); see
+    /// [`GeomCache::export_since`].
+    epoch: u64,
+    /// Monotonic access stamp for LRU trimming; see [`GeomCache::trim_to`].
+    last_used: u64,
 }
 
 /// A content-addressed geometry cache (M4): maps a structural hash of a CSG
@@ -144,9 +153,14 @@ struct CachedNode {
 /// structure changed are re-rendered, the rest are cheap clones; within a single
 /// render it also deduplicates identical subtrees (common-subexpression
 /// elimination).
-#[derive(Default)]
 pub struct GeomCache {
     nodes: HashMap<u64, CachedNode>,
+    /// Current export epoch (starts at 1; see `cache_io`).
+    epoch: u64,
+    /// Access counter behind `CachedNode::last_used`.
+    tick: u64,
+    /// Resident mesh payload bytes.
+    bytes: usize,
 }
 
 impl GeomCache {
@@ -163,6 +177,7 @@ impl GeomCache {
     /// Drop all cached meshes.
     pub fn clear(&mut self) {
         self.nodes.clear();
+        self.bytes = 0;
     }
 }
 
@@ -331,7 +346,9 @@ fn render_cached_diag_mode(
 /// store them with the mesh so a later warm hit re-reports them.
 fn render_node(node: &Node, ctx: &mut Ctx) -> Result<Mesh, GeomError> {
     let key = mode_key(ctx.hashes[&(node as *const Node)], ctx.mode);
-    if let Some(entry) = ctx.cache.nodes.get(&key) {
+    let tick = ctx.cache.touch();
+    if let Some(entry) = ctx.cache.nodes.get_mut(&key) {
+        entry.last_used = tick;
         ctx.warnings.extend(entry.warnings.iter().cloned());
         ctx.errors.extend(entry.errors.iter().cloned());
         return Ok(entry.mesh.clone());
@@ -343,12 +360,19 @@ fn render_node(node: &Node, ctx: &mut Ctx) -> Result<Mesh, GeomError> {
     let mesh = render_uncached(node, ctx)?;
     let warnings = ctx.warnings[warn_start..].to_vec();
     let errors = ctx.errors[err_start..].to_vec();
+    ctx.cache.bytes += cache_io::mesh_bytes(&mesh);
+    let epoch = ctx.cache.epoch;
+    // Stamped after the children so a subtree's root is never older than the
+    // leaves it covers: a parent hit skips them, so LRU must evict them first.
+    let last_used = ctx.cache.touch();
     ctx.cache.nodes.insert(
         key,
         CachedNode {
             mesh: mesh.clone(),
             warnings,
             errors,
+            epoch,
+            last_used,
         },
     );
     Ok(mesh)
@@ -1347,11 +1371,12 @@ fn bbox_overlaps(a: Option<([f64; 3], [f64; 3])>, b: Option<([f64; 3], [f64; 3])
 /// the parent's), so [`render_node`] can look up any subtree's hash in O(1)
 /// without re-traversing it.
 fn hash_all(node: &Node, out: &mut HashMap<*const Node, u64>) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Target-independent (see `cache_io::StableHasher`): keys must match across
+    // wasm32 and native so a persisted cache is portable between them.
+    let mut h = cache_io::StableHasher::new();
     std::mem::discriminant(node).hash(&mut h);
-    let bits = |x: &f64, h: &mut std::collections::hash_map::DefaultHasher| x.to_bits().hash(h);
-    let frags = |f: &openrscad_ir::FragmentSpec,
-                 h: &mut std::collections::hash_map::DefaultHasher| {
+    let bits = |x: &f64, h: &mut cache_io::StableHasher| x.to_bits().hash(h);
+    let frags = |f: &openrscad_ir::FragmentSpec, h: &mut cache_io::StableHasher| {
         f.fn_.to_bits().hash(h);
         f.fa.to_bits().hash(h);
         f.fs.to_bits().hash(h);

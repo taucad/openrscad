@@ -32,8 +32,11 @@ thread_local! {
     static LAST_BENCHMARK_PROFILE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-/// Bound on cached subtrees; past this the cache is reset to cap memory.
+/// Bound on cached subtrees; past this the least recently used are evicted.
 const CACHE_CAP: usize = 8192;
+/// Bound on resident mesh payload bytes; least-recently-used subtrees are
+/// evicted past it (see `GeomCache::trim_to`).
+const CACHE_BYTE_CAP: usize = 256 << 20;
 
 /// Engine version string.
 pub fn version() -> String {
@@ -44,6 +47,63 @@ pub fn version() -> String {
 pub fn clear_cache() {
     CACHE.with(|cache| cache.borrow_mut().clear());
     STRUCTURED_CACHE.with(|cache| *cache.borrow_mut() = None);
+}
+
+/// The envelope every cache blob this engine writes or accepts carries: engine
+/// version plus the id of the CSG kernel the pipeline renders with. Always the
+/// pure-Rust Manifold kernel — every render path in this crate uses it.
+fn cache_envelope() -> openrscad_geom::CacheEnvelope {
+    let kernel = openrscad_geom::RustManifoldKernel::new();
+    openrscad_geom::CacheEnvelope {
+        engine_version: version(),
+        kernel_id: openrscad_geom::Kernel::id(&kernel).to_string(),
+    }
+}
+
+/// Serialize the geometry-cache entries inserted at or after `since_epoch`
+/// (`0` = everything) as an opaque, versioned blob for the host to persist.
+pub fn cache_export(since_epoch: u64) -> Vec<u8> {
+    CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .export_since(since_epoch, &cache_envelope())
+    })
+}
+
+/// Rehydrate entries from a [`cache_export`] blob produced by the same engine
+/// version and kernel. Returns a JSON report; a foreign, malformed or truncated
+/// blob is refused with its reason and leaves the cache unchanged.
+pub fn cache_import(bytes: &[u8]) -> Result<String, String> {
+    CACHE
+        .with(|cache| cache.borrow_mut().import_bytes(bytes, &cache_envelope()))
+        .map(|report| {
+            format!(
+                "{{\"imported\":{},\"skipped\":{},\"entries\":{},\"bytes\":{}}}",
+                report.imported, report.skipped, report.entries, report.bytes
+            )
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// Resident-cache accounting, caps and envelope as JSON.
+pub fn cache_stats() -> String {
+    let stats = CACHE.with(|cache| cache.borrow().stats());
+    let envelope = cache_envelope();
+    format!(
+        "{{\"entries\":{},\"bytes\":{},\"epoch\":{},\"entryCap\":{CACHE_CAP},\"byteCap\":{CACHE_BYTE_CAP},\"engineVersion\":\"{}\",\"kernelId\":\"{}\",\"hashAlgo\":\"{}\",\"formatVersion\":{}}}",
+        stats.entries,
+        stats.bytes,
+        stats.epoch,
+        envelope.engine_version,
+        envelope.kernel_id,
+        openrscad_geom::HASH_ALGO,
+        openrscad_geom::CACHE_FORMAT_VERSION
+    )
+}
+
+/// Every resident structural key, ascending.
+pub fn cache_keys() -> Vec<u64> {
+    CACHE.with(|cache| cache.borrow().keys())
 }
 
 /// The customizer parameter schema for a source string, as a JSON string
@@ -448,9 +508,7 @@ pub fn artifact_3d(request: &Request, options: &ExportOptions) -> Artifact3d {
                 {
                     let (structured, geometry_diagnostics) = CACHE.with(|cache| {
                         let mut cache = cache.borrow_mut();
-                        if cache.len() > CACHE_CAP {
-                            cache.clear();
-                        }
+                        cache.trim_to(CACHE_CAP, CACHE_BYTE_CAP);
                         openrscad_geom::render_structured_cached_diag(
                             &eval.node, &kernel, &mut cache, preview,
                         )
@@ -477,9 +535,7 @@ pub fn artifact_3d(request: &Request, options: &ExportOptions) -> Artifact3d {
         }
         _ => CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
-            if cache.len() > CACHE_CAP {
-                cache.clear();
-            }
+            cache.trim_to(CACHE_CAP, CACHE_BYTE_CAP);
             let (mesh, geometry_diagnostics) =
                 openrscad_geom::render_cached_diag(&eval.node, &kernel, &mut cache)?;
             #[cfg(feature = "benchmark-profile")]
@@ -648,9 +704,7 @@ pub fn render(request: &Request, preview: bool) -> Render {
     let exact_render_started = Instant::now();
     let rendered = CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.len() > CACHE_CAP {
-            cache.clear();
-        }
+        cache.trim_to(CACHE_CAP, CACHE_BYTE_CAP);
         if preview {
             openrscad_geom::render_preview_cached_diag(&eval.node, &kernel, &mut cache)
         } else {

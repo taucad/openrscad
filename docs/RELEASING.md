@@ -2,7 +2,14 @@
 
 One tag ships everything: the desktop installers (`desktop/`, Tauri v2 — native
 builds for macOS, Windows, and Linux that update themselves in place) and the
-`openrscad-engine` npm package (the wasm build of `crates/openrscad-wasm`).
+`@taulabs/openrscad-engine` npm package — one root package holding the wasm build
+(`crates/openrscad-wasm`) plus five generated platform packages
+(`@taulabs/openrscad-engine-{darwin-arm64,darwin-x64,linux-x64-gnu,linux-arm64-gnu,win32-x64-msvc}`)
+carrying the N-API addon (`crates/openrscad-napi`). The package's `node` export
+condition binds the addon when a platform package matches the host and falls
+back to the in-package wasm Node build otherwise. `napi.targets` in
+`packages/npm/package.json` is the only target list; `.github/workflows/native.yml`
+builds, inspects, assembles and smoke-tests every target on its own runner.
 
 Releases are cut by **[changesets](https://github.com/changesets/changesets)**,
 not by tagging by hand.
@@ -50,7 +57,10 @@ Update artifacts per platform:
    from `CHANGELOG.md`), then dispatches:
    - **Release desktop app** — 4-OS installers + `latest.json`, uploaded onto
      that Release.
-   - **Publish engine to npm** — `openrscad-engine`, via OIDC with provenance.
+   - **Publish engine to npm** — the five platform packages first, then the
+     root, from one frozen release tree, via OIDC with provenance. A prerelease
+     version publishes every package under `next`; `latest` is never assigned
+     by a prerelease.
 
    Assets appear a few minutes later. Existing desktop users are offered the
    update as soon as `latest.json` uploads.
@@ -124,12 +134,16 @@ These require secrets, paid accounts, or GitHub UI actions an agent can't do.
 - [ ] **Allow Actions to open PRs**: Settings → Actions → General → **Allow
       GitHub Actions to create and approve pull requests**. Without it the
       changesets action cannot open its Version Packages PR.
-- [ ] **Register the npm trusted publisher** (one-time; `openrscad-engine@0.0.0`
-      already exists on the registry, so only the registration is left):
-      npmjs.com → `openrscad-engine` → Settings → Trusted Publisher → GitHub
-      Actions, with Organization or user `matthova`, Repository `openrscad`,
-      Workflow filename `publish-npm.yml`, Environment blank. Fields are
-      case-sensitive and exact, and npm does not validate them at save time.
+- [x] **Register the npm trusted publishers** (done 2026-09-05 for the root and
+      all five platform packages: repository `taucad/openrscad`, workflow
+      `publish-npm.yml`; each name was reserved with a manifest-only `0.0.0`
+      first, because `npm trust` only binds an existing package). Adding a
+      target to `napi.targets` needs the same two steps for its new package
+      name before the first release that includes it — Tau's
+      `bootstrap-package` skill prepares them.
+- [ ] **Require 2FA and disallow tokens** on npmjs.com for each of the six
+      packages (Settings → Publishing access). Trusted publishing keeps working;
+      a leaked token cannot bypass it.
 
 ### Per release
 

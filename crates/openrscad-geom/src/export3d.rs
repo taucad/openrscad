@@ -53,6 +53,10 @@ pub struct Export3DArtifact {
     pub vertex_count: usize,
     pub volume: f64,
     pub surface_area: f64,
+    /// Export diagnostics: the artifact is complete, but a consumer may want
+    /// to know, for example, that a GLB solid could not declare
+    /// `EXT_mesh_manifold`.
+    pub warnings: Vec<String>,
 }
 
 pub fn export_3d(
@@ -61,9 +65,9 @@ pub fn export_3d(
     options: &Export3DOptions,
 ) -> Result<Export3DArtifact, GeomError> {
     let mesh = &structured.aggregate;
-    let bytes = match format {
-        ExportFormat3D::Glb => serialize_glb(structured, options)?,
-        ExportFormat3D::ThreeMf => serialize_3mf(structured, options)?,
+    let (bytes, warnings) = match format {
+        ExportFormat3D::Glb => serialize_glb_with_diagnostics(structured, options)?,
+        ExportFormat3D::ThreeMf => (serialize_3mf(structured, options)?, Vec::new()),
         _ => {
             return Err(GeomError::Invariant(
                 "authored-scene export only supports GLB and 3MF".to_string(),
@@ -76,6 +80,7 @@ pub fn export_3d(
         vertex_count: mesh.verts.len(),
         volume: mesh.volume(),
         surface_area: mesh.surface_area(),
+        warnings,
     })
 }
 
@@ -143,26 +148,17 @@ impl From<&ProvenanceFrame> for SemanticFrameKey {
     }
 }
 
-#[derive(Default)]
-struct SourceTriangles {
-    by_material: BTreeMap<MaterialKey, Vec<u32>>,
-    all: Vec<u32>,
-}
-
 struct ComponentBuilder {
     key: SemanticFrameKey,
+    path: Vec<SemanticFrameKey>,
     frame: ProvenanceFrame,
     parent: Option<usize>,
     children: Vec<usize>,
-    sources: BTreeMap<usize, SourceTriangles>,
+    /// Every triangle this module owns directly, across solids; only feature
+    /// edges are derived from it; surfaces belong to the solid meshes.
+    triangles: Vec<u32>,
     attribution: AttributionStatus,
     contributors: Vec<Vec<ProvenanceFrame>>,
-}
-
-struct GlbPrimitive<'a> {
-    source: MeshSource<'a>,
-    selection: MeshSelection,
-    material: MaterialKey,
 }
 
 struct GlbEdgeGroup<'a> {
@@ -170,19 +166,49 @@ struct GlbEdgeGroup<'a> {
     selection: MeshSelection,
 }
 
+/// An authored module: a node with no surface mesh of its own. It carries
+/// `extras.openrscad`, its child modules, the solids anchored on it, and a
+/// `LINES`-only mesh when feature edges are requested.
 struct GlbComponent<'a> {
-    frame: Option<ProvenanceFrame>,
+    frame: ProvenanceFrame,
     children: Vec<usize>,
+    solids: Vec<usize>,
     name: String,
-    primitives: Vec<GlbPrimitive<'a>>,
     edge_groups: Vec<GlbEdgeGroup<'a>>,
     attribution: AttributionStatus,
     contributors: Vec<Vec<ProvenanceFrame>>,
 }
 
+/// One primitive of a solid mesh: the solid's triangles that one module (or
+/// no module) owns in one material.
+struct GlbPrimitive {
+    owner: Option<usize>,
+    material: MaterialKey,
+    selection: MeshSelection,
+}
+
+/// One closed solid (a `StructuredMesh::solid_components` entry): one leaf node
+/// and one mesh, hung from the deepest authored module common to its faces.
+struct GlbSolid<'a> {
+    source: MeshSource<'a>,
+    component: &'a MeshSelection,
+    name: String,
+    owners: Vec<usize>,
+    primitives: Vec<GlbPrimitive>,
+    /// Feature edges of the triangles no module owns; they have no module node
+    /// to sit on, so they go on a `LINES`-only child of the solid's node.
+    unowned_edges: Option<GlbEdgeGroup<'a>>,
+}
+
+enum GlbRoot {
+    Component(usize),
+    Solid(usize),
+}
+
 struct CompiledGlb<'a> {
     components: Vec<GlbComponent<'a>>,
-    roots: Vec<usize>,
+    solids: Vec<GlbSolid<'a>>,
+    roots: Vec<GlbRoot>,
 }
 
 fn material_rgba_from_key(material: MaterialKey) -> [u8; 4] {
@@ -236,89 +262,59 @@ fn visit_semantic(index: usize, builders: &[ComponentBuilder], order: &mut Vec<u
     }
 }
 
-fn fallback_name(material: MaterialKey, per_color: &mut BTreeMap<[u8; 4], usize>) -> String {
-    let occurrence = per_color.entry(material.rgba).or_default();
-    *occurrence += 1;
-    format!("{} Shape {occurrence}", rgba_hex(material.rgba))
-}
-
 fn compile_glb<'a>(structured: &'a StructuredMesh) -> CompiledGlb<'a> {
-    let sources = [MeshSource {
+    let source = MeshSource {
         exact: &structured.exact,
         attributions: &structured.attributions,
-    }];
+    };
 
     let mut builders: Vec<ComponentBuilder> = Vec::new();
     let mut by_path: BTreeMap<Vec<SemanticFrameKey>, usize> = BTreeMap::new();
-    let mut anonymous: Vec<(MeshSource<'a>, MaterialKey, MeshSelection)> = Vec::new();
+    let mut triangle_owner: Vec<Option<usize>> = vec![None; source.exact.surface_ids.len()];
 
-    for (source_index, source) in sources.iter().copied().enumerate() {
-        let mut anonymous_buckets: BTreeMap<MaterialKey, Vec<u32>> = BTreeMap::new();
-        for (triangle, surface_id) in source.exact.surface_ids.iter().enumerate() {
-            let surface = &source.attributions[surface_id.0 as usize];
-            let path = super::structured::authored_path(&surface.provenance);
-            let material = MaterialKey::from_surface(surface);
-            if path.is_empty() {
-                anonymous_buckets
-                    .entry(material)
-                    .or_default()
-                    .push(triangle as u32);
-                continue;
-            }
-
-            let mut semantic_path = Vec::with_capacity(path.len());
-            let mut parent = None;
-            for frame in path {
-                semantic_path.push(SemanticFrameKey::from(&frame));
-                let index = if let Some(index) = by_path.get(&semantic_path) {
-                    *index
-                } else {
-                    let index = builders.len();
-                    builders.push(ComponentBuilder {
-                        key: semantic_path.last().unwrap().clone(),
-                        frame,
-                        parent,
-                        children: Vec::new(),
-                        sources: BTreeMap::new(),
-                        attribution: AttributionStatus::Exact,
-                        contributors: Vec::new(),
-                    });
-                    by_path.insert(semantic_path.clone(), index);
-                    if let Some(parent) = parent {
-                        builders[parent].children.push(index);
-                    }
-                    index
-                };
-                parent = Some(index);
-            }
-
-            let owner = parent.expect("non-empty semantic path has an owner");
-            let triangles = builders[owner].sources.entry(source_index).or_default();
-            triangles
-                .by_material
-                .entry(material)
-                .or_default()
-                .push(triangle as u32);
-            triangles.all.push(triangle as u32);
-            if surface.status == AttributionStatus::Ambiguous {
-                builders[owner].attribution = AttributionStatus::Ambiguous;
-            }
-            builders[owner]
-                .contributors
-                .extend(surface.contributors.iter().cloned());
+    for (triangle, surface_id) in source.exact.surface_ids.iter().enumerate() {
+        let surface = &source.attributions[surface_id.0 as usize];
+        let path = super::structured::authored_path(&surface.provenance);
+        if path.is_empty() {
+            continue;
         }
 
-        for (material, triangles) in anonymous_buckets {
-            for component in
-                super::structured::components_for_triangles(&source.exact.mesh, &triangles)
-            {
-                anonymous.push((
-                    source,
-                    material,
-                    super::structured::make_selection(source.exact, source.attributions, component),
-                ));
-            }
+        let mut semantic_path = Vec::with_capacity(path.len());
+        let mut parent = None;
+        for frame in path {
+            semantic_path.push(SemanticFrameKey::from(&frame));
+            let index = if let Some(index) = by_path.get(&semantic_path) {
+                *index
+            } else {
+                let index = builders.len();
+                builders.push(ComponentBuilder {
+                    key: semantic_path.last().unwrap().clone(),
+                    path: semantic_path.clone(),
+                    frame,
+                    parent,
+                    children: Vec::new(),
+                    triangles: Vec::new(),
+                    attribution: AttributionStatus::Exact,
+                    contributors: Vec::new(),
+                });
+                by_path.insert(semantic_path.clone(), index);
+                if let Some(parent) = parent {
+                    builders[parent].children.push(index);
+                }
+                index
+            };
+            parent = Some(index);
         }
+
+        let owner = parent.expect("non-empty semantic path has an owner");
+        triangle_owner[triangle] = Some(owner);
+        builders[owner].triangles.push(triangle as u32);
+        if surface.status == AttributionStatus::Ambiguous {
+            builders[owner].attribution = AttributionStatus::Ambiguous;
+        }
+        builders[owner]
+            .contributors
+            .extend(surface.contributors.iter().cloned());
     }
 
     let builder_keys: Vec<_> = builders.iter().map(|builder| builder.key.clone()).collect();
@@ -348,90 +344,135 @@ fn compile_glb<'a>(structured: &'a StructuredMesh) -> CompiledGlb<'a> {
         .enumerate()
         .map(|(new, old)| (*old, new))
         .collect();
-    let mut components = Vec::with_capacity(builders.len() + anonymous.len());
+    let mut components = Vec::with_capacity(builders.len());
     for old in &old_order {
         let builder = &builders[*old];
-        let mut primitives = Vec::new();
-        let mut edge_groups = Vec::new();
-        for (source_index, triangles) in &builder.sources {
-            let source = sources[*source_index];
-            for (material, selected) in &triangles.by_material {
-                primitives.push(GlbPrimitive {
-                    source,
-                    selection: super::structured::make_selection(
-                        source.exact,
-                        source.attributions,
-                        selected.clone(),
-                    ),
-                    material: *material,
-                });
-            }
-            edge_groups.push(GlbEdgeGroup {
-                source,
-                selection: super::structured::make_selection(
-                    source.exact,
-                    source.attributions,
-                    triangles.all.clone(),
-                ),
-            });
-        }
         components.push(GlbComponent {
-            frame: Some(builder.frame.clone()),
+            frame: builder.frame.clone(),
             children: builder
                 .children
                 .iter()
                 .map(|child| old_to_new[child])
                 .collect(),
+            solids: Vec::new(),
             name: semantic_names[*old].clone(),
-            primitives,
-            edge_groups,
+            edge_groups: vec![GlbEdgeGroup {
+                source,
+                selection: super::structured::make_selection(
+                    source.exact,
+                    source.attributions,
+                    builder.triangles.clone(),
+                ),
+            }],
             attribution: builder.attribution,
             contributors: builder.contributors.clone(),
         });
     }
 
-    anonymous.sort_by(|left, right| {
-        left.1
-            .cmp(&right.1)
-            .then_with(|| super::structured::spatial_order(&left.2, &right.2))
-    });
-    let mut roots: Vec<_> = semantic_roots.iter().map(|root| old_to_new[root]).collect();
-    let mut per_color = BTreeMap::new();
-    for (source, material, selection) in anonymous {
-        let index = components.len();
-        roots.push(index);
-        let name = fallback_name(material, &mut per_color);
-        let mut contributors: Vec<_> = selection
-            .triangles
+    let semantic_paths: Vec<_> = structured
+        .solid_components
+        .iter()
+        .map(|component| solid_semantic_paths(structured, component))
+        .collect();
+    let names = solid_names(structured, &semantic_paths);
+    let mut solids = Vec::with_capacity(structured.solid_components.len());
+    let mut roots: Vec<_> = semantic_roots
+        .iter()
+        .map(|root| GlbRoot::Component(old_to_new[root]))
+        .collect();
+    for ((component, paths), name) in structured
+        .solid_components
+        .iter()
+        .zip(&semantic_paths)
+        .zip(names)
+    {
+        let mut groups: BTreeMap<(bool, Option<usize>, MaterialKey), Vec<u32>> = BTreeMap::new();
+        let mut unowned = Vec::new();
+        for triangle in &component.triangles {
+            let surface =
+                &source.attributions[source.exact.surface_ids[*triangle as usize].0 as usize];
+            let owner = triangle_owner[*triangle as usize].map(|old| old_to_new[&old]);
+            if owner.is_none() {
+                unowned.push(*triangle);
+            }
+            groups
+                .entry((owner.is_none(), owner, MaterialKey::from_surface(surface)))
+                .or_default()
+                .push(*triangle);
+        }
+        let mut owners: Vec<usize> = groups.keys().filter_map(|(_, owner, _)| *owner).collect();
+        owners.dedup();
+
+        // The deepest authored module common to every face's semantic path and
+        // every owner, so the solid sits under (or at) each module that owns a
+        // face of it. A path that names a module with no node of its own
+        // (a contributor that kept no faces) falls back to its nearest
+        // ancestor that has one.
+        let mut anchor_paths: Vec<Vec<SemanticFrameKey>> = paths
             .iter()
-            .flat_map(|triangle| {
-                let surface_id = source.exact.surface_ids[*triangle as usize];
-                source.attributions[surface_id.0 as usize]
-                    .contributors
-                    .iter()
-                    .cloned()
-            })
+            .map(|path| path.iter().map(SemanticFrameKey::from).collect())
             .collect();
-        contributors
-            .sort_by(|left, right| super::structured::compare_provenance_paths(left, right));
-        contributors.dedup();
-        let attribution = selection.attribution;
-        components.push(GlbComponent {
-            frame: None,
-            children: Vec::new(),
+        anchor_paths.extend(groups.keys().map(|(_, owner, _)| match owner {
+            Some(owner) => builders[old_order[*owner]].path.clone(),
+            None => Vec::new(),
+        }));
+        let mut prefix = anchor_paths.first().cloned().unwrap_or_default();
+        for path in &anchor_paths[1..] {
+            let common = prefix
+                .iter()
+                .zip(path)
+                .take_while(|(left, right)| left == right)
+                .count();
+            prefix.truncate(common);
+        }
+        let anchor = loop {
+            if prefix.is_empty() {
+                break None;
+            }
+            if let Some(old) = by_path.get(&prefix) {
+                break Some(old_to_new[old]);
+            }
+            prefix.pop();
+        };
+
+        let index = solids.len();
+        match anchor {
+            Some(anchor) => components[anchor].solids.push(index),
+            None => roots.push(GlbRoot::Solid(index)),
+        }
+        solids.push(GlbSolid {
+            source,
+            component,
             name,
-            primitives: vec![GlbPrimitive {
+            owners,
+            primitives: groups
+                .into_iter()
+                .map(|((_, owner, material), triangles)| GlbPrimitive {
+                    owner,
+                    material,
+                    selection: super::structured::make_selection(
+                        source.exact,
+                        source.attributions,
+                        triangles,
+                    ),
+                })
+                .collect(),
+            unowned_edges: (!unowned.is_empty()).then(|| GlbEdgeGroup {
                 source,
-                selection: selection.clone(),
-                material,
-            }],
-            edge_groups: vec![GlbEdgeGroup { source, selection }],
-            attribution,
-            contributors,
+                selection: super::structured::make_selection(
+                    source.exact,
+                    source.attributions,
+                    unowned,
+                ),
+            }),
         });
     }
 
-    CompiledGlb { components, roots }
+    CompiledGlb {
+        components,
+        solids,
+        roots,
+    }
 }
 
 fn validate_finite(structured: &StructuredMesh, scale: f64) -> Result<(), GeomError> {
@@ -552,15 +593,25 @@ fn u32_bytes(values: &[u32]) -> Vec<u8> {
     bytes
 }
 
-fn add_view(views: &mut Vec<Value>, buffer: &mut Vec<u8>, bytes: &[u8], target: u32) -> usize {
+/// Appends one buffer view. `target` is `None` for data no vertex or index
+/// fetch reads directly, such as the sparse merge lists of `EXT_mesh_manifold`.
+fn add_view(
+    views: &mut Vec<Value>,
+    buffer: &mut Vec<u8>,
+    bytes: &[u8],
+    target: Option<u32>,
+) -> usize {
     let (offset, length) = append_aligned(buffer, bytes);
     let index = views.len();
-    views.push(json!({
+    let mut view = json!({
         "buffer": 0,
         "byteLength": length,
         "byteOffset": offset,
-        "target": target,
-    }));
+    });
+    if let Some(target) = target {
+        view["target"] = json!(target);
+    }
+    views.push(view);
     index
 }
 
@@ -598,14 +649,25 @@ fn add_vec3_accessor(
     index
 }
 
-fn add_index_accessor(accessors: &mut Vec<Value>, view: usize, count: usize) -> usize {
+/// Appends a `u32` scalar accessor over `count` elements of `view`, starting
+/// `first` elements in.
+fn add_index_accessor(
+    accessors: &mut Vec<Value>,
+    view: usize,
+    first: usize,
+    count: usize,
+) -> usize {
     let index = accessors.len();
-    accessors.push(json!({
+    let mut accessor = json!({
         "bufferView": view,
         "componentType": 5125,
         "count": count,
         "type": "SCALAR",
-    }));
+    });
+    if first > 0 {
+        accessor["byteOffset"] = json!(first * 4);
+    }
+    accessors.push(accessor);
     index
 }
 
@@ -848,17 +910,77 @@ fn feature_edges(source: MeshSource<'_>, selection: &MeshSelection) -> Vec<[u32;
     result
 }
 
+#[cfg(test)]
 pub(crate) fn serialize_glb(
     structured: &StructuredMesh,
     options: &Export3DOptions,
 ) -> Result<Vec<u8>, GeomError> {
+    serialize_glb_with_diagnostics(structured, options).map(|(bytes, _)| bytes)
+}
+
+/// Derives one owner's (or one solid's unowned) feature lines and writes them
+/// as a `LINES` primitive, or returns `None` when there are none.
+fn edge_primitive(
+    edge_group: &GlbEdgeGroup<'_>,
+    line_material: usize,
+    options: &Export3DOptions,
+    views: &mut Vec<Value>,
+    buffer: &mut Vec<u8>,
+    accessors: &mut Vec<Value>,
+) -> Option<Value> {
+    #[cfg(feature = "benchmark-profile")]
+    let edge_started = Instant::now();
+    let edges = feature_edges(edge_group.source, &edge_group.selection);
+    #[cfg(feature = "benchmark-profile")]
+    super::structured::record_edge_derivation(
+        edge_started.elapsed().as_secs_f64() * 1_000.0,
+        edges.len(),
+    );
+    if edges.is_empty() {
+        return None;
+    }
+    let mut line_positions = Vec::with_capacity(edges.len() * 2);
+    let mut line_indices = Vec::with_capacity(edges.len() * 2);
+    for edge in edges {
+        for vertex in edge {
+            line_positions.push(gltf_point(
+                edge_group.source.exact.mesh.verts[vertex as usize],
+                options.source_unit_to_meters,
+                options.coordinate_system,
+            ));
+            line_indices.push(line_indices.len() as u32);
+        }
+    }
+    let position_view = add_view(views, buffer, &f32_bytes(&line_positions), Some(34962));
+    let index_view = add_view(views, buffer, &u32_bytes(&line_indices), Some(34963));
+    let position_accessor = add_vec3_accessor(accessors, position_view, &line_positions, true);
+    let index_accessor = add_index_accessor(accessors, index_view, 0, line_indices.len());
+    // `mode: 1` and the shared Feature Edges material already identify a
+    // generated edge primitive; no consumer read the extras tag that used to
+    // sit here.
+    Some(json!({
+        "attributes": { "POSITION": position_accessor },
+        "indices": index_accessor,
+        "material": line_material,
+        "mode": 1,
+    }))
+}
+
+/// Serializes a GLB and returns the export diagnostics alongside it: one per
+/// solid whose index stream is not an oriented 2-manifold, which is then
+/// written without `EXT_mesh_manifold` rather than fused or dropped.
+pub(crate) fn serialize_glb_with_diagnostics(
+    structured: &StructuredMesh,
+    options: &Export3DOptions,
+) -> Result<(Vec<u8>, Vec<String>), GeomError> {
     validate_finite(structured, options.source_unit_to_meters)?;
 
     let compiled = compile_glb(structured);
+    let mut diagnostics = Vec::new();
     let mut colors: Vec<_> = compiled
-        .components
+        .solids
         .iter()
-        .flat_map(|component| component.primitives.iter())
+        .flat_map(|solid| solid.primitives.iter())
         .map(|primitive| material_rgba_from_key(primitive.material))
         .collect();
     colors.sort_unstable();
@@ -912,105 +1034,23 @@ pub(crate) fn serialize_glb(
     let mut accessors = Vec::new();
     let mut meshes = Vec::new();
     let mut nodes = Vec::new();
+    let solid_node = |solid: usize| compiled.components.len() + solid;
+
+    // Authored modules: nodes 0..components, mesh-less unless they own lines.
     for component in &compiled.components {
         let mut primitives = Vec::new();
-        for primitive in &component.primitives {
-            let triangles = canonical_triangles(&primitive.source.exact.mesh, &primitive.selection);
-            let mut positions = Vec::with_capacity(triangles.len() * 3);
-            let mut normals = Vec::with_capacity(triangles.len() * 3);
-            let mut indices = Vec::with_capacity(triangles.len() * 3);
-            for (_, triangle) in &triangles {
-                let normal = triangle_normal(&primitive.source.exact.mesh, *triangle);
-                // A zero-area triangle has no normal, and `normalize` says so with
-                // a zero vector — which glTF rejects, because NORMAL must be unit
-                // length. The direction is arbitrary for a face with no area, so
-                // pick one rather than write an invalid file. Only the attribute
-                // substitutes: `triangle_normal` stays honest for the dihedral
-                // comparison, where a degenerate face reading as a crease is the
-                // conservative answer.
-                let normal = if normal == [0.0, 0.0, 0.0] {
-                    [0.0, 0.0, 1.0]
-                } else {
-                    normal
-                };
-                let normal = gltf_normal(normal, options.coordinate_system);
-                for vertex in triangle {
-                    positions.push(gltf_point(
-                        primitive.source.exact.mesh.verts[*vertex as usize],
-                        options.source_unit_to_meters,
-                        options.coordinate_system,
-                    ));
-                    normals.push(normal);
-                    indices.push(indices.len() as u32);
-                }
-            }
-            let position_view = add_view(&mut views, &mut buffer, &f32_bytes(&positions), 34962);
-            let normal_view = add_view(&mut views, &mut buffer, &f32_bytes(&normals), 34962);
-            let index_view = add_view(&mut views, &mut buffer, &u32_bytes(&indices), 34963);
-            let position_accessor =
-                add_vec3_accessor(&mut accessors, position_view, &positions, true);
-            let normal_accessor = add_vec3_accessor(&mut accessors, normal_view, &normals, false);
-            let index_accessor = add_index_accessor(&mut accessors, index_view, indices.len());
-            let display_mode = primitive.material.display_mode();
-            let mut primitive = json!({
-                "attributes": { "NORMAL": normal_accessor, "POSITION": position_accessor },
-                "indices": index_accessor,
-                "material": material_by_color[&material_rgba_from_key(primitive.material)],
-                "mode": 4,
-            });
-            if structured.include_display_modes {
-                primitive["extras"] = json!({
-                    "openrscad": { "displayMode": display_mode }
-                });
-            }
-            primitives.push(primitive);
-        }
-
         if let Some(line_material) = line_material {
             for edge_group in &component.edge_groups {
-                #[cfg(feature = "benchmark-profile")]
-                let edge_started = Instant::now();
-                let edges = feature_edges(edge_group.source, &edge_group.selection);
-                #[cfg(feature = "benchmark-profile")]
-                super::structured::record_edge_derivation(
-                    edge_started.elapsed().as_secs_f64() * 1_000.0,
-                    edges.len(),
-                );
-                if edges.is_empty() {
-                    continue;
-                }
-                let mut line_positions = Vec::with_capacity(edges.len() * 2);
-                let mut line_indices = Vec::with_capacity(edges.len() * 2);
-                for edge in edges {
-                    for vertex in edge {
-                        line_positions.push(gltf_point(
-                            edge_group.source.exact.mesh.verts[vertex as usize],
-                            options.source_unit_to_meters,
-                            options.coordinate_system,
-                        ));
-                        line_indices.push(line_indices.len() as u32);
-                    }
-                }
-                let position_view =
-                    add_view(&mut views, &mut buffer, &f32_bytes(&line_positions), 34962);
-                let index_view =
-                    add_view(&mut views, &mut buffer, &u32_bytes(&line_indices), 34963);
-                let position_accessor =
-                    add_vec3_accessor(&mut accessors, position_view, &line_positions, true);
-                let index_accessor =
-                    add_index_accessor(&mut accessors, index_view, line_indices.len());
-                // `mode: 1` and the shared Feature Edges material already
-                // identify a generated edge primitive; no consumer read the
-                // extras tag that used to sit here.
-                primitives.push(json!({
-                    "attributes": { "POSITION": position_accessor },
-                    "indices": index_accessor,
-                    "material": line_material,
-                    "mode": 1,
-                }));
+                primitives.extend(edge_primitive(
+                    edge_group,
+                    line_material,
+                    options,
+                    &mut views,
+                    &mut buffer,
+                    &mut accessors,
+                ));
             }
         }
-
         let mesh_index = if primitives.is_empty() {
             None
         } else {
@@ -1022,28 +1062,13 @@ pub(crate) fn serialize_glb(
             AttributionStatus::Exact => "exact",
             AttributionStatus::Ambiguous => "ambiguous",
         };
-        let mut openrscad = if let Some(frame) = &component.frame {
-            json!({
-                "attribution": attribution,
-                "callSite": span_json(&frame.call_site, &options.source_keys),
-                "definitionSite": frame.definition_site.as_ref().map(|span| span_json(span, &options.source_keys)),
-                "moduleName": frame.module_name,
-            })
-        } else {
-            let mut provenance = Vec::new();
-            for primitive in &component.primitives {
-                for frame in &primitive.selection.provenance {
-                    if !provenance.contains(frame) {
-                        provenance.push(frame.clone());
-                    }
-                }
-            }
-            json!({
-                "attribution": attribution,
-                "fallback": true,
-                "provenance": provenance_json(&provenance, &options.source_keys),
-            })
-        };
+        let frame = &component.frame;
+        let mut openrscad = json!({
+            "attribution": attribution,
+            "callSite": span_json(&frame.call_site, &options.source_keys),
+            "definitionSite": frame.definition_site.as_ref().map(|span| span_json(span, &options.source_keys)),
+            "moduleName": frame.module_name,
+        });
         if !component.contributors.is_empty() {
             openrscad["contributors"] = Value::Array(
                 component
@@ -1060,17 +1085,235 @@ pub(crate) fn serialize_glb(
         if let Some(mesh_index) = mesh_index {
             node["mesh"] = json!(mesh_index);
         }
-        if !component.children.is_empty() {
-            node["children"] = json!(component.children);
+        let children: Vec<_> = component
+            .children
+            .iter()
+            .copied()
+            .chain(component.solids.iter().map(|solid| solid_node(*solid)))
+            .collect();
+        if !children.is_empty() {
+            node["children"] = json!(children);
         }
+        nodes.push(node);
+    }
+
+    // Closed solids: nodes components..components + solids, one mesh each.
+    let mut edge_nodes = Vec::new();
+    let mut manifold_used = false;
+    for solid in &compiled.solids {
+        let mesh = &solid.source.exact.mesh;
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        let mut corner_vertices = Vec::new();
+        let mut ranges = Vec::with_capacity(solid.primitives.len());
+        for primitive in &solid.primitives {
+            let start = positions.len();
+            for (_, triangle) in canonical_triangles(mesh, &primitive.selection) {
+                let normal = triangle_normal(mesh, triangle);
+                // A zero-area triangle has no normal, and `normalize` says so with
+                // a zero vector — which glTF rejects, because NORMAL must be unit
+                // length. The direction is arbitrary for a face with no area, so
+                // pick one rather than write an invalid file. Only the attribute
+                // substitutes: `triangle_normal` stays honest for the dihedral
+                // comparison, where a degenerate face reading as a crease is the
+                // conservative answer.
+                let normal = if normal == [0.0, 0.0, 0.0] {
+                    [0.0, 0.0, 1.0]
+                } else {
+                    normal
+                };
+                let normal = gltf_normal(normal, options.coordinate_system);
+                for vertex in triangle {
+                    positions.push(gltf_point(
+                        mesh.verts[vertex as usize],
+                        options.source_unit_to_meters,
+                        options.coordinate_system,
+                    ));
+                    normals.push(normal);
+                    corner_vertices.push(vertex);
+                }
+            }
+            ranges.push((start, positions.len() - start));
+        }
+
+        // Flat shading keeps one corner per triangle vertex, so the render
+        // stream is the identity and every primitive is a slice of it.
+        let render_indices: Vec<u32> = (0..positions.len() as u32).collect();
+        let position_view = add_view(&mut views, &mut buffer, &f32_bytes(&positions), Some(34962));
+        let normal_view = add_view(&mut views, &mut buffer, &f32_bytes(&normals), Some(34962));
+        let index_view = add_view(
+            &mut views,
+            &mut buffer,
+            &u32_bytes(&render_indices),
+            Some(34963),
+        );
+        let position_accessor = add_vec3_accessor(&mut accessors, position_view, &positions, true);
+        let normal_accessor = add_vec3_accessor(&mut accessors, normal_view, &normals, false);
+        let mut primitives = Vec::with_capacity(solid.primitives.len());
+        for (primitive, (start, count)) in solid.primitives.iter().zip(&ranges) {
+            let index_accessor = add_index_accessor(&mut accessors, index_view, *start, *count);
+            let mut value = json!({
+                "attributes": { "NORMAL": normal_accessor, "POSITION": position_accessor },
+                "indices": index_accessor,
+                "material": material_by_color[&material_rgba_from_key(primitive.material)],
+                "mode": 4,
+            });
+            let mut extras = serde_json::Map::new();
+            if structured.include_display_modes {
+                extras.insert(
+                    "displayMode".to_string(),
+                    json!(primitive.material.display_mode()),
+                );
+            }
+            if let Some(owner) = primitive.owner {
+                extras.insert("owner".to_string(), json!(owner));
+            }
+            if !extras.is_empty() {
+                value["extras"] = json!({ "openrscad": extras });
+            }
+            primitives.push(value);
+        }
+
+        let mut mesh_json = json!({ "name": solid.name, "primitives": primitives });
+        match validate_closed_component("GLB solid", mesh, solid.component)
+            .and_then(|()| validate_vertex_links(mesh, solid.component))
+        {
+            Ok(()) => {
+                // The exact mesh is indexed, so a corner's canonical vertex is
+                // the first corner that names the same exact vertex. Merged
+                // corners come from one exact vertex and so carry identical
+                // positions, as `EXT_mesh_manifold` requires.
+                let mut canonical: HashMap<u32, u32> = HashMap::new();
+                let mut merge_indices = Vec::new();
+                let mut merge_values = Vec::new();
+                for (corner, vertex) in corner_vertices.iter().enumerate() {
+                    let corner = corner as u32;
+                    let first = *canonical.entry(*vertex).or_insert(corner);
+                    if first != corner {
+                        merge_indices.push(corner);
+                        merge_values.push(first);
+                    }
+                }
+                let manifold_accessor =
+                    add_index_accessor(&mut accessors, index_view, 0, render_indices.len());
+                let mut extension = json!({
+                    "manifoldPrimitive": {
+                        "attributes": { "POSITION": position_accessor },
+                        "indices": manifold_accessor,
+                        "mode": 4,
+                    },
+                });
+                if !merge_indices.is_empty() {
+                    let mut merge_bytes = u32_bytes(&merge_indices);
+                    merge_bytes.extend_from_slice(&u32_bytes(&merge_values));
+                    let merge_view = add_view(&mut views, &mut buffer, &merge_bytes, None);
+                    let values_offset = merge_indices.len() * 4;
+                    let merge_indices_accessor =
+                        add_index_accessor(&mut accessors, merge_view, 0, merge_indices.len());
+                    let merge_values_accessor = add_index_accessor(
+                        &mut accessors,
+                        merge_view,
+                        merge_indices.len(),
+                        merge_values.len(),
+                    );
+                    accessors[manifold_accessor]["sparse"] = json!({
+                        "count": merge_indices.len(),
+                        "indices": { "bufferView": merge_view, "componentType": 5125 },
+                        "values": { "bufferView": merge_view, "byteOffset": values_offset },
+                    });
+                    extension["mergeIndices"] = json!(merge_indices_accessor);
+                    extension["mergeValues"] = json!(merge_values_accessor);
+                }
+                mesh_json["extensions"] = json!({ "EXT_mesh_manifold": extension });
+                manifold_used = true;
+            }
+            Err(error) => diagnostics.push(format!(
+                "GLB solid \"{}\" was exported without EXT_mesh_manifold: {error}",
+                solid.name
+            )),
+        }
+        let mesh_index = meshes.len();
+        meshes.push(mesh_json);
+
+        let attribution = match solid.component.attribution {
+            AttributionStatus::Exact => "exact",
+            AttributionStatus::Ambiguous => "ambiguous",
+        };
+        let mut openrscad = json!({
+            "attribution": attribution,
+            "owners": solid.owners,
+            "solid": true,
+        });
+        if solid.owners.is_empty() {
+            // No module owns any face, so no module node carries its
+            // provenance: the solid node keeps it, as fallback parts did.
+            let mut contributors: Vec<_> = solid
+                .component
+                .triangles
+                .iter()
+                .flat_map(|triangle| {
+                    let surface_id = solid.source.exact.surface_ids[*triangle as usize];
+                    solid.source.attributions[surface_id.0 as usize]
+                        .contributors
+                        .iter()
+                        .cloned()
+                })
+                .collect();
+            contributors
+                .sort_by(|left, right| super::structured::compare_provenance_paths(left, right));
+            contributors.dedup();
+            openrscad["fallback"] = json!(true);
+            openrscad["provenance"] =
+                provenance_json(&solid.component.provenance, &options.source_keys);
+            if !contributors.is_empty() {
+                openrscad["contributors"] = Value::Array(
+                    contributors
+                        .iter()
+                        .map(|path| provenance_json(path, &options.source_keys))
+                        .collect(),
+                );
+            }
+        }
+        nodes.push(json!({
+            "extras": { "openrscad": openrscad },
+            "mesh": mesh_index,
+            "name": solid.name,
+        }));
+
+        if let (Some(line_material), Some(edge_group)) = (line_material, &solid.unowned_edges) {
+            if let Some(primitive) = edge_primitive(
+                edge_group,
+                line_material,
+                options,
+                &mut views,
+                &mut buffer,
+                &mut accessors,
+            ) {
+                let name = format!("{} Edges", solid.name);
+                let mesh_index = meshes.len();
+                meshes.push(json!({ "name": name, "primitives": [primitive] }));
+                edge_nodes.push((nodes.len() - 1, json!({ "mesh": mesh_index, "name": name })));
+            }
+        }
+    }
+    for (parent, node) in edge_nodes {
+        nodes[parent]["children"] = json!([nodes.len()]);
         nodes.push(node);
     }
     while buffer.len() % 4 != 0 {
         buffer.push(0);
     }
+    let roots: Vec<_> = compiled
+        .roots
+        .iter()
+        .map(|root| match root {
+            GlbRoot::Component(component) => *component,
+            GlbRoot::Solid(solid) => solid_node(*solid),
+        })
+        .collect();
     let mut scene = json!({});
-    if !compiled.roots.is_empty() {
-        scene["nodes"] = json!(compiled.roots);
+    if !roots.is_empty() {
+        scene["nodes"] = json!(roots);
     }
     let mut document = json!({
         "asset": {
@@ -1078,7 +1321,7 @@ pub(crate) fn serialize_glb(
             "version": "2.0",
             "extras": {
                 "openrscad": {
-                    "schemaVersion": 1,
+                    "schemaVersion": 2,
                     "status": "experimental",
                     "sources": options.source_keys.iter().enumerate().map(|(source_id, source)| {
                         json!({ "sourceId": source_id, "source": safe_source_key(source) })
@@ -1107,8 +1350,15 @@ pub(crate) fn serialize_glb(
     if !buffer.is_empty() {
         document["buffers"] = json!([{ "byteLength": buffer.len() }]);
     }
+    let mut extensions_used = Vec::new();
+    if manifold_used {
+        extensions_used.push("EXT_mesh_manifold");
+    }
     if options.include_edges {
-        document["extensionsUsed"] = json!(["KHR_materials_unlit"]);
+        extensions_used.push("KHR_materials_unlit");
+    }
+    if !extensions_used.is_empty() {
+        document["extensionsUsed"] = json!(extensions_used);
     }
     let mut json_bytes = serde_json::to_vec(&document)
         .map_err(|error| GeomError::Invariant(format!("GLB JSON serialization failed: {error}")))?;
@@ -1135,7 +1385,7 @@ pub(crate) fn serialize_glb(
         glb.extend_from_slice(b"BIN\0");
         glb.extend_from_slice(&buffer);
     }
-    Ok(glb)
+    Ok((glb, diagnostics))
 }
 
 fn xml_number(value: f64) -> Result<String, GeomError> {
@@ -1180,14 +1430,22 @@ fn compact_component(
     (vertices, compact)
 }
 
-fn validate_closed_component(mesh: &Mesh, selection: &MeshSelection) -> Result<(), GeomError> {
+/// Requires `selection` to be an oriented 2-manifold over the exact mesh's
+/// vertex indices: no collapsed triangle, and every edge shared by exactly two
+/// triangles that traverse it in opposite directions. `subject` names the
+/// exported object in the error.
+fn validate_closed_component(
+    subject: &str,
+    mesh: &Mesh,
+    selection: &MeshSelection,
+) -> Result<(), GeomError> {
     let mut edges: BTreeMap<(u32, u32), (usize, i32)> = BTreeMap::new();
     for triangle_id in &selection.triangles {
         let triangle = mesh.tris[*triangle_id as usize];
         if triangle[0] == triangle[1] || triangle[1] == triangle[2] || triangle[2] == triangle[0] {
-            return Err(GeomError::NonManifold(
-                "3MF object contains a degenerate triangle".to_string(),
-            ));
+            return Err(GeomError::NonManifold(format!(
+                "{subject} contains a degenerate triangle"
+            )));
         }
         for [from, to] in [
             [triangle[0], triangle[1]],
@@ -1205,9 +1463,42 @@ fn validate_closed_component(mesh: &Mesh, selection: &MeshSelection) -> Result<(
         .find(|(_, (count, orientation))| *count != 2 || *orientation != 0)
     {
         return Err(GeomError::NonManifold(format!(
-            "3MF object edge {}-{} has {} incident triangles and orientation balance {}",
+            "{subject} edge {}-{} has {} incident triangles and orientation balance {}",
             edge.0, edge.1, incidence.0, incidence.1
         )));
+    }
+    Ok(())
+}
+
+/// Requires the triangles around every vertex of `selection` to form one fan,
+/// so that a vertex two otherwise separate sheets merely touch (a pinch) is
+/// not declared manifold. Assumes [`validate_closed_component`] passed.
+fn validate_vertex_links(mesh: &Mesh, selection: &MeshSelection) -> Result<(), GeomError> {
+    let mut links: BTreeMap<u32, Vec<(u32, u32)>> = BTreeMap::new();
+    for triangle_id in &selection.triangles {
+        let [a, b, c] = mesh.tris[*triangle_id as usize];
+        links.entry(a).or_default().push((b, c));
+        links.entry(b).or_default().push((c, a));
+        links.entry(c).or_default().push((a, b));
+    }
+    for (vertex, link) in links {
+        let mut slots: BTreeMap<u32, usize> = BTreeMap::new();
+        for (left, right) in &link {
+            let next = slots.len();
+            slots.entry(*left).or_insert(next);
+            let next = slots.len();
+            slots.entry(*right).or_insert(next);
+        }
+        let mut union = super::structured::UnionFind::new(slots.len());
+        for (left, right) in &link {
+            union.union(slots[left], slots[right]);
+        }
+        let root = union.find(0);
+        if (1..slots.len()).any(|slot| union.find(slot) != root) {
+            return Err(GeomError::NonManifold(format!(
+                "GLB solid vertex {vertex} joins separate triangle fans"
+            )));
+        }
     }
     Ok(())
 }
@@ -1356,7 +1647,7 @@ pub(crate) fn serialize_3mf(
         model.push_str("</basematerials>\n");
     }
     for (component_index, component) in structured.solid_components.iter().enumerate() {
-        validate_closed_component(&structured.exact.mesh, component)?;
+        validate_closed_component("3MF object", &structured.exact.mesh, component)?;
         let (vertices, triangles) = compact_component(structured, component);
         if triangles.is_empty() {
             continue;
@@ -1526,8 +1817,7 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn threemf_rejects_open_physical_objects() {
+    fn open_triangle_scene() -> StructuredMesh {
         let scene = AttributedMesh {
             mesh: Mesh {
                 verts: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -1546,7 +1836,7 @@ mod tests {
             attribution: AttributionStatus::Exact,
             geometry_hash: 0,
         };
-        let structured = StructuredMesh {
+        StructuredMesh {
             aggregate: scene.mesh.clone(),
             exact: scene,
             include_display_modes: false,
@@ -1559,9 +1849,12 @@ mod tests {
                 contribution: super::super::ContributionKind::Boundary,
                 status: AttributionStatus::Exact,
             }],
-        };
+        }
+    }
 
-        let error = serialize_3mf(&structured, &Export3DOptions::default()).unwrap_err();
+    #[test]
+    fn threemf_rejects_open_physical_objects() {
+        let error = serialize_3mf(&open_triangle_scene(), &Export3DOptions::default()).unwrap_err();
         assert!(matches!(error, GeomError::NonManifold(_)));
     }
 
@@ -1600,9 +1893,20 @@ mod tests {
         assert_eq!(surface_triangle_count(&document), 20);
         assert_eq!(document["scenes"][0]["nodes"], json!([0]));
         assert_eq!(document["nodes"][0]["name"], "Assembly");
-        assert_eq!(document["nodes"][0]["children"], json!([1, 2]));
+        assert_eq!(document["nodes"][0]["children"], json!([1, 2, 3]));
         assert_eq!(document["nodes"][1]["name"], "Lower Frame");
         assert_eq!(document["nodes"][2]["name"], "Roof Frame");
+        for module in 0..3 {
+            assert!(document["nodes"][module].get("mesh").is_none());
+        }
+        // The two frames touch, so they are one solid under their common owner,
+        // its faces tagged with the frame that owns them.
+        let solid = &document["nodes"][3];
+        assert_eq!(solid["name"], "Assembly Solid");
+        assert_eq!(
+            primitive_owners(&document, solid),
+            [(json!(1), 10), (json!(2), 10)]
+        );
         assert_eq!(
             document["nodes"][2]["extras"]["openrscad"]["moduleName"],
             "roof_frame"
@@ -1645,9 +1949,17 @@ mod tests {
             .map(|node| node["name"].as_str().unwrap())
             .collect();
 
-        assert_eq!(names, ["Left Part", "Right Part"]);
-        assert_eq!(node_surface_triangle_count(&document, 0), 12);
-        assert_eq!(node_surface_triangle_count(&document, 1), 12);
+        // Unfused siblings stay two overlapping solids, one under each module.
+        assert_eq!(
+            names,
+            ["Left Part", "Right Part", "Left Part", "Right Part"]
+        );
+        assert_eq!(document["nodes"][0]["children"], json!([2]));
+        assert_eq!(document["nodes"][1]["children"], json!([3]));
+        assert_eq!(node_surface_triangle_count(&document, 0), 0);
+        assert_eq!(node_surface_triangle_count(&document, 1), 0);
+        assert_eq!(node_surface_triangle_count(&document, 2), 12);
+        assert_eq!(node_surface_triangle_count(&document, 3), 12);
         assert!((structured.aggregate.volume() - 12.0).abs() < 1e-6);
 
         let model_xml =
@@ -1724,10 +2036,11 @@ mod tests {
     }
 
     #[test]
-    fn glb_vendor_contract_is_declared_experimental_version_one() {
+    fn glb_vendor_contract_is_declared_experimental_version_two() {
         let document = glb_json(&serialize_glb(&two_cubes(), &Export3DOptions::default()).unwrap());
 
-        assert_eq!(document["asset"]["extras"]["openrscad"]["schemaVersion"], 1);
+        assert_eq!(document["asset"]["extras"]["openrscad"]["schemaVersion"], 2);
+        assert_eq!(document["extensionsUsed"], json!(["EXT_mesh_manifold"]));
         assert_eq!(
             document["asset"]["extras"]["openrscad"]["status"],
             "experimental"
@@ -2098,8 +2411,18 @@ mod tests {
     fn feature_segments(structured: &StructuredMesh) -> Vec<[[f64; 3]; 2]> {
         let compiled = compile_glb(structured);
         let mut segments: BTreeMap<[[u64; 3]; 2], [[f64; 3]; 2]> = BTreeMap::new();
-        for component in &compiled.components {
-            for group in &component.edge_groups {
+        let groups = compiled
+            .components
+            .iter()
+            .flat_map(|component| component.edge_groups.iter())
+            .chain(
+                compiled
+                    .solids
+                    .iter()
+                    .filter_map(|solid| solid.unowned_edges.as_ref()),
+            );
+        {
+            for group in groups {
                 for edge in feature_edges(group.source, &group.selection) {
                     let points = edge.map(|vertex| group.source.exact.mesh.verts[vertex as usize]);
                     let mut key = points.map(|point| point.map(|value| value.to_bits()));
@@ -2262,42 +2585,22 @@ mod tests {
 
     #[test]
     fn one_authored_module_with_two_colors_emits_one_mesh_with_two_primitives() {
-        let node = authored(
-            "painted_part",
-            10,
-            Node::Union(vec![
-                Node::Color {
-                    rgba: [1.0, 0.0, 0.0, 1.0],
-                    child: Box::new(Node::Cube {
-                        size: [1.0, 1.0, 1.0],
-                        center: false,
-                    }),
-                },
-                Node::Color {
-                    rgba: [0.0, 0.0, 1.0, 1.0],
-                    child: Box::new(Node::Translate {
-                        v: [0.0, 0.0, 2.0],
-                        child: Box::new(Node::Cube {
-                            size: [1.0, 1.0, 1.0],
-                            center: false,
-                        }),
-                    }),
-                },
-            ]),
-        );
+        let node = authored("painted_part", 10, two_colour_fused());
         let document =
             glb_json(&serialize_glb(&rendered(&node), &Export3DOptions::default()).unwrap());
 
-        assert_eq!(document["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(document["nodes"].as_array().unwrap().len(), 2);
         assert_eq!(document["nodes"][0]["name"], "Painted Part");
+        assert!(document["nodes"][0].get("mesh").is_none());
+        assert_eq!(document["nodes"][0]["children"], json!([1]));
+        assert_eq!(document["nodes"][1]["name"], "Painted Part");
         assert_eq!(document["meshes"].as_array().unwrap().len(), 1);
         assert_eq!(
-            document["meshes"][0]["primitives"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
+            primitive_owners(&document, &document["nodes"][1]),
+            [(json!(0), 18), (json!(0), 18)]
         );
+        let primitives = document["meshes"][0]["primitives"].as_array().unwrap();
+        assert_ne!(primitives[0]["material"], primitives[1]["material"]);
     }
 
     #[test]
@@ -2327,9 +2630,16 @@ mod tests {
         let document = glb_json(&serialize_glb(&structured, &Export3DOptions::default()).unwrap());
 
         assert_eq!(document["nodes"][0]["name"], "Assembly");
-        assert!(document["nodes"][0]["mesh"].is_number());
-        assert_eq!(document["nodes"][0]["children"], json!([1]));
+        assert!(document["nodes"][0].get("mesh").is_none());
+        assert_eq!(document["nodes"][0]["children"], json!([1, 2]));
         assert_eq!(document["nodes"][1]["name"], "Cap");
+        assert!(document["nodes"][1].get("mesh").is_none());
+        let solid = &document["nodes"][2];
+        assert_eq!(solid["name"], "Assembly Solid");
+        assert_eq!(
+            primitive_owners(&document, solid),
+            [(json!(0), 10), (json!(1), 10)]
+        );
         assert_eq!(
             surface_triangle_count(&document),
             structured.exact.mesh.tris.len() as u64
@@ -2344,6 +2654,22 @@ mod tests {
         assert_eq!(document["nodes"][0]["name"], "#F5A523FF Shape 1");
         assert_eq!(document["nodes"][1]["name"], "#F5A523FF Shape 2");
         assert!(document["nodes"][0]["extras"]["openrscad"]["moduleName"].is_null());
+        assert_eq!(
+            document["nodes"][0]["extras"]["openrscad"]["fallback"],
+            true
+        );
+        assert_eq!(
+            document["nodes"][0]["extras"]["openrscad"]["owners"],
+            json!([])
+        );
+        // A scene with no modules and one material keeps one node and one
+        // single-primitive mesh per solid.
+        assert_eq!(document["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(document["meshes"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            primitive_owners(&document, &document["nodes"][0]),
+            [(Value::Null, 12)]
+        );
     }
 
     #[test]
@@ -2396,12 +2722,17 @@ mod tests {
             .collect();
 
         assert_eq!(names, ["Bench 1", "Bench 2", "Arch Loop"]);
+        assert_eq!(children.len(), 3, "the four cubes are separate solids");
+        // The loop instances share one call site, so one node owns both
+        // solids, each its own leaf.
         let arch = children[2].as_u64().unwrap() as usize;
-        let mesh = document["nodes"][arch]["mesh"].as_u64().unwrap() as usize;
-        let accessor = document["meshes"][mesh]["primitives"][0]["indices"]
-            .as_u64()
-            .unwrap() as usize;
-        assert_eq!(document["accessors"][accessor]["count"], 72);
+        assert!(document["nodes"][arch].get("mesh").is_none());
+        let solids = document["nodes"][arch]["children"].as_array().unwrap();
+        assert_eq!(solids.len(), 2);
+        for solid in solids {
+            let solid = &document["nodes"][solid.as_u64().unwrap() as usize];
+            assert_eq!(primitive_owners(&document, solid), [(json!(arch), 12)]);
+        }
     }
 
     #[test]
@@ -2572,42 +2903,32 @@ mod tests {
         assert_eq!(edge_derivation_count(), 2);
         assert_eq!(serialize_glb(&structured, &options).unwrap(), edged);
         let edged = glb_json(&edged);
-        assert_eq!(edged["nodes"].as_array().unwrap().len(), 2);
-        for mesh in edged["meshes"].as_array().unwrap() {
+        // No module owns these solids, so each solid's lines sit on a
+        // `LINES`-only child: a manifold mesh holds triangles only.
+        assert_eq!(edged["scenes"][0]["nodes"], json!([0, 1]));
+        assert_eq!(edged["nodes"].as_array().unwrap().len(), 4);
+        for (solid, edges) in [(0, 2), (1, 3)] {
+            assert_eq!(edged["nodes"][solid]["children"], json!([edges]));
+            assert_eq!(
+                edged["nodes"][edges]["name"],
+                format!("{} Edges", edged["nodes"][solid]["name"].as_str().unwrap())
+            );
+            let mesh = &edged["meshes"][edged["nodes"][solid]["mesh"].as_u64().unwrap() as usize];
             let primitives = mesh["primitives"].as_array().unwrap();
-            assert_eq!(primitives.len(), 2);
+            assert_eq!(primitives.len(), 1);
             assert_eq!(primitives[0]["mode"], 4);
-            assert_eq!(primitives[1]["mode"], 1);
-            let line_accessor = primitives[1]["indices"].as_u64().unwrap() as usize;
+            let mesh = &edged["meshes"][edged["nodes"][edges]["mesh"].as_u64().unwrap() as usize];
+            let primitives = mesh["primitives"].as_array().unwrap();
+            assert_eq!(primitives.len(), 1);
+            assert_eq!(primitives[0]["mode"], 1);
+            let line_accessor = primitives[0]["indices"].as_u64().unwrap() as usize;
             assert_eq!(edged["accessors"][line_accessor]["count"], 24);
         }
     }
 
     #[test]
     fn multicolor_owner_derives_one_edge_group_after_all_surface_primitives() {
-        let node = authored(
-            "painted_part",
-            10,
-            Node::Union(vec![
-                Node::Color {
-                    rgba: [1.0, 0.0, 0.0, 1.0],
-                    child: Box::new(Node::Cube {
-                        size: [1.0, 1.0, 1.0],
-                        center: false,
-                    }),
-                },
-                Node::Color {
-                    rgba: [0.0, 0.0, 1.0, 1.0],
-                    child: Box::new(Node::Translate {
-                        v: [0.0, 0.0, 2.0],
-                        child: Box::new(Node::Cube {
-                            size: [1.0, 1.0, 1.0],
-                            center: false,
-                        }),
-                    }),
-                },
-            ]),
-        );
+        let node = authored("painted_part", 10, two_colour_fused());
         reset_edge_derivation_count();
         let document = glb_json(
             &serialize_glb(
@@ -2621,12 +2942,18 @@ mod tests {
         );
 
         assert_eq!(edge_derivation_count(), 1);
-        assert_eq!(document["nodes"].as_array().unwrap().len(), 1);
-        let primitives = document["meshes"][0]["primitives"].as_array().unwrap();
-        assert_eq!(primitives.len(), 3);
-        assert_eq!(primitives[0]["mode"], 4);
-        assert_eq!(primitives[1]["mode"], 4);
-        assert_eq!(primitives[2]["mode"], 1);
+        assert_eq!(document["nodes"].as_array().unwrap().len(), 2);
+        // The owner's lines are a `LINES`-only mesh on the module node; the
+        // solid's mesh keeps its two surface primitives.
+        let owner = document["nodes"][0]["mesh"].as_u64().unwrap() as usize;
+        let lines = document["meshes"][owner]["primitives"].as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["mode"], 1);
+        let solid = document["nodes"][1]["mesh"].as_u64().unwrap() as usize;
+        let surfaces = document["meshes"][solid]["primitives"].as_array().unwrap();
+        assert_eq!(surfaces.len(), 2);
+        assert_eq!(surfaces[0]["mode"], 4);
+        assert_eq!(surfaces[1]["mode"], 4);
     }
 
     fn fnv1a(bytes: &[u8]) -> u64 {
@@ -2752,5 +3079,536 @@ mod tests {
         assert_eq!(srgb_to_linear(11).to_bits(), 0x3b5b_518d);
         assert_eq!(srgb_to_linear(128).to_bits(), 0x3e5d_0a8b);
         assert_eq!(fnv1a(&bits), 0x1a45_ac26_a93d_8502, "the sRGB curve moved");
+    }
+
+    /// Reads one accessor's elements as little-endian 32-bit words.
+    fn accessor_words(document: &Value, binary: &[u8], accessor: usize, width: usize) -> Vec<u32> {
+        let accessor = &document["accessors"][accessor];
+        let view = &document["bufferViews"][accessor["bufferView"].as_u64().unwrap() as usize];
+        let start = view["byteOffset"].as_u64().unwrap_or(0) as usize
+            + accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
+        let count = accessor["count"].as_u64().unwrap() as usize * width;
+        (0..count)
+            .map(|index| {
+                let at = start + index * 4;
+                u32::from_le_bytes(binary[at..at + 4].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    /// Every rendered triangle as its three `f32` position bit patterns,
+    /// rotated to start at its smallest corner (winding kept) and sorted, so two
+    /// exports compare equal exactly when they carry the same triangles,
+    /// whatever their node, mesh and primitive grouping.
+    fn aggregate_triangle_set(bytes: &[u8]) -> Vec<[[u32; 3]; 3]> {
+        let document = glb_json(bytes);
+        let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let binary = &bytes[(20 + json_length + 8).min(bytes.len())..];
+        let mut triangles = Vec::new();
+        for mesh in document["meshes"].as_array().into_iter().flatten() {
+            for primitive in mesh["primitives"].as_array().unwrap() {
+                if primitive["mode"] != 4 {
+                    continue;
+                }
+                let positions = accessor_words(
+                    &document,
+                    binary,
+                    primitive["attributes"]["POSITION"].as_u64().unwrap() as usize,
+                    3,
+                );
+                let indices = accessor_words(
+                    &document,
+                    binary,
+                    primitive["indices"].as_u64().unwrap() as usize,
+                    1,
+                );
+                for corners in indices.chunks(3) {
+                    let mut triangle = [[0u32; 3]; 3];
+                    for (slot, index) in corners.iter().enumerate() {
+                        let at = *index as usize * 3;
+                        triangle[slot] = [positions[at], positions[at + 1], positions[at + 2]];
+                    }
+                    let first = (1..3).fold(0, |best, next| {
+                        if triangle[next] < triangle[best] {
+                            next
+                        } else {
+                            best
+                        }
+                    });
+                    triangle.rotate_left(first);
+                    triangles.push(triangle);
+                }
+            }
+        }
+        triangles.sort_unstable();
+        triangles
+    }
+
+    fn triangle_set_hash(bytes: &[u8]) -> u64 {
+        let words: Vec<u8> = aggregate_triangle_set(bytes)
+            .iter()
+            .flatten()
+            .flatten()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        fnv1a(&words)
+    }
+
+    fn unit_cube_at(v: [f64; 3]) -> Node {
+        Node::Translate {
+            v,
+            child: Box::new(Node::Cube {
+                size: [1.0, 1.0, 1.0],
+                center: false,
+            }),
+        }
+    }
+
+    fn painted(rgba: [f32; 4], child: Node) -> Node {
+        Node::Color {
+            rgba,
+            child: Box::new(child),
+        }
+    }
+
+    /// `modules.scad` in miniature: a module that bores a hole through a block
+    /// another module builds, so one solid has two authored owners.
+    fn bored_block() -> Node {
+        authored(
+            "chamfered_cube_cutout",
+            10,
+            Node::Difference(vec![
+                authored(
+                    "chamfered_block",
+                    40,
+                    Node::Cube {
+                        size: [10.0, 10.0, 10.0],
+                        center: true,
+                    },
+                ),
+                Node::Cylinder {
+                    h: 12.0,
+                    r1: 3.0,
+                    r2: 3.0,
+                    center: true,
+                    frags: FragmentSpec {
+                        fn_: 24.0,
+                        ..FragmentSpec::default()
+                    },
+                },
+            ]),
+        )
+    }
+
+    /// `union.scad`: two sibling modules fused by a top-level union.
+    fn sibling_union() -> Node {
+        Node::Union(vec![
+            authored(
+                "left_block",
+                10,
+                Node::Cube {
+                    size: [10.0, 10.0, 10.0],
+                    center: true,
+                },
+            ),
+            authored(
+                "right_block",
+                30,
+                Node::Translate {
+                    v: [6.0, 0.0, 0.0],
+                    child: Box::new(Node::Cube {
+                        size: [10.0, 10.0, 10.0],
+                        center: true,
+                    }),
+                },
+            ),
+        ])
+    }
+
+    /// `twosolids.scad`: one module producing two disjoint solids.
+    fn pair() -> Node {
+        authored(
+            "pair",
+            10,
+            Node::Union(vec![
+                unit_cube_at([0.0, 0.0, 0.0]),
+                unit_cube_at([10.0, 0.0, 0.0]),
+            ]),
+        )
+    }
+
+    /// Two colours fused into one solid with no authored owner.
+    fn two_colour_fused() -> Node {
+        Node::Union(vec![
+            painted([1.0, 0.0, 0.0, 1.0], unit_cube_at([0.0, 0.0, 0.0])),
+            painted([0.0, 0.0, 1.0, 1.0], unit_cube_at([0.5, 0.5, 0.5])),
+        ])
+    }
+
+    fn layout_scenes() -> Vec<(&'static str, Node)> {
+        vec![
+            (
+                "two_cubes",
+                Node::Union(vec![
+                    unit_cube_at([0.0, 0.0, 0.0]),
+                    unit_cube_at([0.0, 0.0, 2.0]),
+                ]),
+            ),
+            ("bored_block", bored_block()),
+            ("sibling_union", sibling_union()),
+            ("pair", pair()),
+            ("two_colour_fused", two_colour_fused()),
+            (
+                "painted_part",
+                authored(
+                    "painted_part",
+                    10,
+                    Node::Union(vec![
+                        painted([1.0, 0.0, 0.0, 1.0], unit_cube_at([0.0, 0.0, 0.0])),
+                        painted([0.0, 0.0, 1.0, 1.0], unit_cube_at([0.0, 0.0, 2.0])),
+                    ]),
+                ),
+            ),
+            (
+                "assembly_with_cap",
+                authored(
+                    "assembly",
+                    10,
+                    Node::Union(vec![
+                        unit_cube_at([0.0, 0.0, 0.0]),
+                        authored("cap", 20, unit_cube_at([0.0, 0.0, 1.0])),
+                    ]),
+                ),
+            ),
+        ]
+    }
+
+    /// Decodes every `EXT_mesh_manifold` declaration and checks it against the
+    /// extension: `TRIANGLES` only, one shared `POSITION` (and `NORMAL`), every
+    /// index accessor on one buffer view, a manifold stream whose dense part is
+    /// the render stream, merges (equal to the sparse substitutions) only
+    /// between bitwise-identical positions, and an oriented 2-manifold result.
+    /// Returns how many meshes declared it.
+    fn assert_manifold_meshes(bytes: &[u8]) -> usize {
+        let document = glb_json(bytes);
+        let json_length = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let binary = &bytes[(20 + json_length + 8).min(bytes.len())..];
+        let accessor = |index: &Value| &document["accessors"][index.as_u64().unwrap() as usize];
+        let words = |index: &Value, width: usize| {
+            accessor_words(&document, binary, index.as_u64().unwrap() as usize, width)
+        };
+        let mut declared = 0;
+        for mesh in document["meshes"].as_array().into_iter().flatten() {
+            let Some(extension) = mesh["extensions"].get("EXT_mesh_manifold") else {
+                continue;
+            };
+            declared += 1;
+            let primitives = mesh["primitives"].as_array().unwrap();
+            let attributes = &primitives[0]["attributes"];
+            let index_view = &accessor(&primitives[0]["indices"])["bufferView"];
+            let mut render = Vec::new();
+            for primitive in primitives {
+                assert_eq!(primitive["mode"], 4);
+                assert_eq!(&primitive["attributes"], attributes);
+                assert_eq!(&accessor(&primitive["indices"])["bufferView"], index_view);
+                render.extend(words(&primitive["indices"], 1));
+            }
+            let manifold = &extension["manifoldPrimitive"];
+            assert_eq!(manifold["mode"], 4);
+            assert_eq!(
+                manifold["attributes"],
+                json!({ "POSITION": attributes["POSITION"] })
+            );
+            assert!(manifold.get("material").is_none());
+            let manifold_accessor = accessor(&manifold["indices"]);
+            assert_eq!(&manifold_accessor["bufferView"], index_view);
+            let mut indices = words(&manifold["indices"], 1);
+            assert_eq!(indices, render);
+            let positions = words(&attributes["POSITION"], 3);
+            if let Some(sparse) = manifold_accessor.get("sparse") {
+                let merge_indices = words(&extension["mergeIndices"], 1);
+                let merge_values = words(&extension["mergeValues"], 1);
+                let merge_index_accessor = accessor(&extension["mergeIndices"]);
+                let merge_value_accessor = accessor(&extension["mergeValues"]);
+                assert_eq!(sparse["count"], json!(merge_indices.len()));
+                assert_eq!(merge_values.len(), merge_indices.len());
+                assert_eq!(
+                    sparse["indices"]["bufferView"],
+                    merge_index_accessor["bufferView"]
+                );
+                assert_eq!(
+                    sparse["indices"]["byteOffset"].as_u64().unwrap_or(0),
+                    merge_index_accessor["byteOffset"].as_u64().unwrap_or(0)
+                );
+                assert_eq!(
+                    sparse["values"]["bufferView"],
+                    merge_value_accessor["bufferView"]
+                );
+                assert_eq!(
+                    sparse["values"]["byteOffset"].as_u64().unwrap_or(0),
+                    merge_value_accessor["byteOffset"].as_u64().unwrap_or(0)
+                );
+                assert!(merge_indices.windows(2).all(|pair| pair[0] < pair[1]));
+                for (index, value) in merge_indices.iter().zip(&merge_values) {
+                    let (from, to) = (indices[*index as usize] as usize, *value as usize);
+                    assert_eq!(
+                        positions[from * 3..from * 3 + 3],
+                        positions[to * 3..to * 3 + 3]
+                    );
+                    indices[*index as usize] = *value;
+                }
+            } else {
+                assert!(extension.get("mergeIndices").is_none());
+            }
+            let manifold_mesh = Mesh {
+                verts: positions
+                    .chunks(3)
+                    .map(|point| point.iter().map(|bits| f64::from(f32::from_bits(*bits))))
+                    .map(|mut point| {
+                        [
+                            point.next().unwrap(),
+                            point.next().unwrap(),
+                            point.next().unwrap(),
+                        ]
+                    })
+                    .collect(),
+                tris: indices
+                    .chunks(3)
+                    .map(|triangle| [triangle[0], triangle[1], triangle[2]])
+                    .collect(),
+            };
+            let everything = MeshSelection {
+                triangles: (0..manifold_mesh.tris.len() as u32).collect(),
+                bounds: Default::default(),
+                provenance: Vec::new(),
+                attribution: AttributionStatus::Exact,
+                geometry_hash: 0,
+            };
+            validate_closed_component("manifold stream", &manifold_mesh, &everything).unwrap();
+            validate_vertex_links(&manifold_mesh, &everything).unwrap();
+        }
+        declared
+    }
+
+    /// `(owner, triangle count)` for each primitive of a node's mesh, in order.
+    fn primitive_owners(document: &Value, node: &Value) -> Vec<(Value, u64)> {
+        let mesh = node["mesh"].as_u64().unwrap() as usize;
+        document["meshes"][mesh]["primitives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|primitive| {
+                let accessor = primitive["indices"].as_u64().unwrap() as usize;
+                (
+                    primitive["extras"]["openrscad"]["owner"].clone(),
+                    document["accessors"][accessor]["count"].as_u64().unwrap() / 3,
+                )
+            })
+            .collect()
+    }
+
+    fn declares_manifold(document: &Value, node: &Value) -> bool {
+        let mesh = node["mesh"].as_u64().unwrap() as usize;
+        document["meshes"][mesh]["extensions"]
+            .get("EXT_mesh_manifold")
+            .is_some()
+    }
+
+    /// Only grouping, structure and metadata changed: every scene renders
+    /// exactly the triangles (positions and winding, bit for bit) that the
+    /// previous module-grouped exporter wrote. The hashes were taken from that
+    /// exporter (`cd59bec`) with this same reader.
+    #[test]
+    fn glb_aggregate_triangle_set_is_identical_to_the_previous_grouping() {
+        let previous: BTreeMap<&str, (u64, usize)> = BTreeMap::from([
+            ("two_cubes", (0xb6ea_cdb6_c7d0_aaa9, 24)),
+            ("bored_block", (0x920e_75a5_ba66_5b85, 112)),
+            ("sibling_union", (0x017f_f69f_214e_39a3, 28)),
+            ("pair", (0xf9bb_3acc_6d27_8ad1, 24)),
+            ("two_colour_fused", (0x58fd_1688_15d2_a4dd, 36)),
+            ("painted_part", (0xb6ea_cdb6_c7d0_aaa9, 24)),
+            ("assembly_with_cap", (0xc7d0_ab5a_0813_6c65, 20)),
+        ]);
+        for (name, node) in layout_scenes() {
+            let structured = rendered(&node);
+            for include_edges in [false, true] {
+                let options = Export3DOptions {
+                    include_edges,
+                    ..Export3DOptions::default()
+                };
+                let bytes = serialize_glb(&structured, &options).unwrap();
+                assert_eq!(
+                    (
+                        triangle_set_hash(&bytes),
+                        aggregate_triangle_set(&bytes).len()
+                    ),
+                    previous[name],
+                    "{name} (edges: {include_edges})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_solid_mesh_declares_an_oriented_two_manifold_stream() {
+        for (name, node) in layout_scenes() {
+            let structured = rendered(&node);
+            for include_edges in [false, true] {
+                let options = Export3DOptions {
+                    include_edges,
+                    ..Export3DOptions::default()
+                };
+                let (bytes, diagnostics) =
+                    serialize_glb_with_diagnostics(&structured, &options).unwrap();
+                assert!(diagnostics.is_empty(), "{name}: {diagnostics:?}");
+                let document = glb_json(&bytes);
+                assert_eq!(
+                    assert_manifold_meshes(&bytes),
+                    structured.solid_components.len(),
+                    "{name}"
+                );
+                assert_eq!(document["extensionsUsed"][0], "EXT_mesh_manifold");
+                // Lines never share a manifold mesh.
+                for mesh in document["meshes"].as_array().unwrap() {
+                    let modes: BTreeSet<_> = mesh["primitives"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|primitive| primitive["mode"].as_u64().unwrap())
+                        .collect();
+                    assert_eq!(modes.len(), 1, "{name}: mixed modes in {}", mesh["name"]);
+                    assert_eq!(
+                        mesh["extensions"].get("EXT_mesh_manifold").is_some(),
+                        modes.contains(&4),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `modules.scad`: the module that bores the block and the module that
+    /// builds it share one solid, so the solid hangs under the outer module and
+    /// its primitives say which module owns which faces.
+    #[test]
+    fn module_cutout_emits_one_solid_under_its_outer_module() {
+        let document = glb_json(
+            &serialize_glb(&rendered(&bored_block()), &Export3DOptions::default()).unwrap(),
+        );
+
+        assert_eq!(document["scenes"][0]["nodes"], json!([0]));
+        assert_eq!(document["nodes"].as_array().unwrap().len(), 3);
+        assert_eq!(document["nodes"][0]["name"], "Chamfered Cube Cutout");
+        assert_eq!(document["nodes"][0]["children"], json!([1, 2]));
+        assert!(document["nodes"][0].get("mesh").is_none());
+        assert_eq!(
+            document["nodes"][0]["extras"]["openrscad"]["moduleName"],
+            "chamfered_cube_cutout"
+        );
+        assert_eq!(document["nodes"][1]["name"], "Chamfered Block");
+        assert!(document["nodes"][1].get("mesh").is_none());
+        assert_eq!(
+            document["nodes"][1]["extras"]["openrscad"]["moduleName"],
+            "chamfered_block"
+        );
+        let solid = &document["nodes"][2];
+        assert_eq!(solid["name"], "Chamfered Cube Cutout Solid");
+        assert_eq!(document["meshes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            primitive_owners(&document, solid),
+            [(json!(0), 48), (json!(1), 64)]
+        );
+        assert!(declares_manifold(&document, solid));
+        assert_eq!(solid["extras"]["openrscad"]["owners"], json!([0, 1]));
+    }
+
+    /// `union.scad`: sibling modules fused at the top level have no common
+    /// owner, so their one solid is a scene root named `Shape`.
+    #[test]
+    fn sibling_union_is_one_root_shape_with_two_owners() {
+        let document = glb_json(
+            &serialize_glb(&rendered(&sibling_union()), &Export3DOptions::default()).unwrap(),
+        );
+        let names: Vec<_> = document["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["name"].as_str().unwrap())
+            .collect();
+
+        assert_eq!(names, ["Left Block", "Right Block", "Shape"]);
+        assert_eq!(document["scenes"][0]["nodes"], json!([0, 1, 2]));
+        assert!(document["nodes"][0].get("mesh").is_none());
+        assert!(document["nodes"][1].get("mesh").is_none());
+        assert_eq!(
+            primitive_owners(&document, &document["nodes"][2]),
+            [(json!(0), 14), (json!(1), 14)]
+        );
+        assert!(declares_manifold(&document, &document["nodes"][2]));
+    }
+
+    /// `twosolids.scad`: one module that makes two disjoint solids gets one
+    /// leaf node and mesh per solid.
+    #[test]
+    fn one_module_with_two_disjoint_solids_emits_two_leaf_solids() {
+        let document =
+            glb_json(&serialize_glb(&rendered(&pair()), &Export3DOptions::default()).unwrap());
+
+        assert_eq!(document["scenes"][0]["nodes"], json!([0]));
+        assert_eq!(document["nodes"][0]["name"], "Pair");
+        assert!(document["nodes"][0].get("mesh").is_none());
+        assert_eq!(document["nodes"][0]["children"], json!([1, 2]));
+        for (index, name) in [(1, "Pair 1"), (2, "Pair 2")] {
+            let solid = &document["nodes"][index];
+            assert_eq!(solid["name"], name);
+            assert_eq!(primitive_owners(&document, solid), [(json!(0), 12)]);
+            assert!(declares_manifold(&document, solid));
+        }
+    }
+
+    /// Colour does not split a solid: two colours fused with no authored owner
+    /// are one fallback-named mesh with one primitive per colour.
+    #[test]
+    fn two_colour_fused_anonymous_solid_is_one_mesh_with_two_primitives() {
+        let document = glb_json(
+            &serialize_glb(&rendered(&two_colour_fused()), &Export3DOptions::default()).unwrap(),
+        );
+
+        assert_eq!(document["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(document["meshes"].as_array().unwrap().len(), 1);
+        let solid = &document["nodes"][0];
+        assert_eq!(solid["name"], "#FF0000FF Shape");
+        assert_eq!(solid["extras"]["openrscad"]["fallback"], true);
+        let primitives = document["meshes"][0]["primitives"].as_array().unwrap();
+        assert_eq!(primitives.len(), 2);
+        assert!(primitives
+            .iter()
+            .all(|primitive| primitive.get("extras").is_none()));
+        assert_ne!(primitives[0]["material"], primitives[1]["material"]);
+        assert!(declares_manifold(&document, solid));
+    }
+
+    /// An open sheet cannot be declared manifold. It is still exported, whole
+    /// and unfused, without the extension, and the export says why.
+    #[test]
+    fn non_manifold_solid_is_exported_without_the_extension_and_reported() {
+        let artifact = export_3d(
+            &open_triangle_scene(),
+            ExportFormat3D::Glb,
+            &Export3DOptions::default(),
+        )
+        .unwrap();
+        let document = glb_json(&artifact.bytes);
+
+        assert_eq!(surface_triangle_count(&document), 1);
+        assert!(document["meshes"][0].get("extensions").is_none());
+        assert!(document.get("extensionsUsed").is_none());
+        assert_eq!(artifact.warnings.len(), 1);
+        assert!(
+            artifact.warnings[0].contains("EXT_mesh_manifold"),
+            "{:?}",
+            artifact.warnings
+        );
+        assert_eq!(assert_manifold_meshes(&artifact.bytes), 0);
     }
 }

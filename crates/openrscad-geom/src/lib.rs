@@ -2742,11 +2742,18 @@ mod tests {
         let edged = serialize_glb(&structured, &options).unwrap();
         assert!(edge_derivation_count() > 0);
         let edged_json = parse_glb_json(&edged);
-        assert!(edged_json["meshes"].as_array().unwrap().iter().all(|mesh| {
-            let primitives = mesh["primitives"].as_array().unwrap();
-            primitives.len() == 2 && primitives[0]["mode"] == 4 && primitives[1]["mode"] == 1
-        }));
-        assert_eq!(edged_json["nodes"].as_array().unwrap().len(), 2);
+        // Each solid mesh keeps its one surface primitive and declares
+        // `EXT_mesh_manifold`; its lines go on a `LINES`-only child node.
+        let meshes = edged_json["meshes"].as_array().unwrap();
+        assert!(meshes
+            .iter()
+            .all(|mesh| mesh["primitives"].as_array().unwrap().len() == 1));
+        let modes: Vec<_> = meshes
+            .iter()
+            .map(|mesh| mesh["primitives"][0]["mode"].as_u64().unwrap())
+            .collect();
+        assert_eq!(modes, [4, 1, 4, 1]);
+        assert_eq!(edged_json["nodes"].as_array().unwrap().len(), 4);
     }
 
     /// Bake-off: the pure-Rust Manifold kernel must agree with the C++ Manifold

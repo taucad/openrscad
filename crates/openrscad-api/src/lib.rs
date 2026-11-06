@@ -553,6 +553,7 @@ pub fn artifact_3d(request: &Request, options: &ExportOptions) -> Artifact3d {
                 vertex_count: mesh.verts.len(),
                 volume: mesh.volume(),
                 surface_area: mesh.surface_area(),
+                warnings: Vec::new(),
             });
             #[cfg(feature = "benchmark-profile")]
             {
@@ -597,6 +598,17 @@ pub fn artifact_3d(request: &Request, options: &ExportOptions) -> Artifact3d {
             warnings.push('\n');
         }
         warnings.push_str(warning);
+    }
+    // Export diagnostics (a GLB solid that could not declare
+    // `EXT_mesh_manifold`, say) describe a complete artifact, so they join the
+    // warnings channel rather than the error one.
+    if let Ok(artifact) = &artifact {
+        for warning in &artifact.warnings {
+            if !warnings.is_empty() {
+                warnings.push('\n');
+            }
+            warnings.push_str(warning);
+        }
     }
     let geom_errors = geometry_diagnostics.errors.join("\n");
     match artifact {

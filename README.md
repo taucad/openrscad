@@ -91,6 +91,12 @@ CDN usage, and the full API.
 - **Export real files** — 3D solids to **STL / OFF / OBJ / 3MF / AMF / GLB**, 2D
   profiles to **DXF / SVG**, and rendered **PNG** images (headless on the CLI,
   no GPU required). `import()` reads meshes and 2D profiles back in.
+  GLB keeps your authored modules as the node hierarchy (mesh-less nodes with
+  their source provenance) and writes every closed solid as one leaf node and
+  mesh declaring `EXT_mesh_manifold`, hung under the deepest module that owns
+  all of its faces. A solid's primitives are split by owning module and colour,
+  each tagged with its owner node in `extras.openrscad.owner`; optional feature
+  lines are separate `LINES`-only meshes.
 - **Keep your work** — files, parameters, and the active tab autosave locally
   and restore on reload.
 

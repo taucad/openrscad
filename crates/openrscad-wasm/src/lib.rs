@@ -729,10 +729,19 @@ mod tests {
         let mut edged = export(source, "glb", true);
         assert!(edged.ok(), "{}", edged.error());
         let json = glb_json(&edged.take_bytes());
-        assert!(json["meshes"].as_array().unwrap().iter().all(|mesh| {
-            let primitives = mesh["primitives"].as_array().unwrap();
-            primitives.len() == 2 && primitives[0]["mode"] == 4 && primitives[1]["mode"] == 1
-        }));
+        // Solid meshes declare `EXT_mesh_manifold` and so hold triangles only;
+        // feature lines are separate `LINES`-only meshes.
+        let modes: Vec<_> = json["meshes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|mesh| {
+                let primitives = mesh["primitives"].as_array().unwrap();
+                assert_eq!(primitives.len(), 1);
+                primitives[0]["mode"].as_u64().unwrap()
+            })
+            .collect();
+        assert_eq!(modes, [4, 1, 4, 1]);
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), test)]
@@ -771,8 +780,8 @@ mod tests {
 
         assert_eq!(document["scenes"][0]["nodes"], serde_json::json!([0]));
         assert_eq!(document["nodes"][0]["name"], "Greenhouse");
-        assert!(document["nodes"][0]["mesh"].is_number());
-        assert_eq!(document["nodes"][0]["children"], serde_json::json!([1]));
+        assert!(document["nodes"][0].get("mesh").is_none());
+        assert_eq!(document["nodes"][0]["children"], serde_json::json!([1, 3]));
         assert_eq!(document["nodes"][1]["name"], "Roof Frame");
         assert_eq!(document["nodes"][1]["children"], serde_json::json!([2]));
         assert_eq!(document["nodes"][2]["name"], "Arch Loop");
@@ -780,7 +789,31 @@ mod tests {
             document["nodes"][1]["extras"]["openrscad"]["definitionSite"]["source"],
             "roof.scad"
         );
-        assert_eq!(document["nodes"].as_array().unwrap().len(), 3);
+        // Structural siblings are not fused, so the base and each loop
+        // instance is its own solid, a leaf under the module that owns it.
+        assert_eq!(
+            document["nodes"][2]["children"],
+            serde_json::json!([4, 5, 6])
+        );
+        let solids: Vec<_> = document["nodes"].as_array().unwrap()[3..]
+            .iter()
+            .map(|node| node["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            solids,
+            ["Greenhouse", "Arch Loop 1", "Arch Loop 2", "Arch Loop 3"]
+        );
+        let owners: Vec<_> = document["meshes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|mesh| mesh["primitives"][0]["extras"]["openrscad"]["owner"].clone())
+            .collect();
+        assert_eq!(
+            owners,
+            serde_json::json!([0, 2, 2, 2]).as_array().unwrap().clone()
+        );
+        assert_eq!(document["nodes"].as_array().unwrap().len(), 7);
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), test)]

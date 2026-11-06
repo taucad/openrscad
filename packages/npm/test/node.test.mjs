@@ -62,7 +62,13 @@ test("the Node facade exports deterministic multipart GLB with optional native e
   const edgedJson = JSON.parse(
     new TextDecoder().decode(edged.bytes.subarray(20, 20 + edgedLength)),
   );
-  assert.ok(edgedJson.meshes.every((mesh) => mesh.primitives.length === 2));
+  // Solid meshes declare EXT_mesh_manifold and hold triangles only, so each
+  // solid's feature lines are a separate LINES-only mesh.
+  assert.deepEqual(
+    edgedJson.meshes.map((mesh) => mesh.primitives.map((primitive) => primitive.mode)),
+    [[4], [1], [4], [1]],
+  );
+  assert.deepEqual(edgedJson.extensionsUsed, ["EXT_mesh_manifold", "KHR_materials_unlit"]);
 });
 
 test("the Node facade preserves authored module hierarchy independently of fallback naming", async () => {
@@ -84,12 +90,17 @@ test("the Node facade preserves authored module hierarchy independently of fallb
   );
 
   assert.deepEqual(json.scenes[0].nodes, [0]);
+  // Modules are mesh-less nodes; each unfused solid is a leaf under its owner.
   assert.deepEqual(
     json.nodes.map((node) => node.name),
-    ["Assembly", "Lower Frame", "Roof Frame"],
+    ["Assembly", "Lower Frame", "Roof Frame", "Lower Frame", "Roof Frame"],
   );
   assert.deepEqual(json.nodes[0].children, [1, 2]);
+  assert.deepEqual(json.nodes[1].children, [3]);
+  assert.deepEqual(json.nodes[2].children, [4]);
   assert.equal(json.nodes[2].extras.openrscad.moduleName, "roof_frame");
+  assert.equal(json.nodes[2].mesh, undefined);
+  assert.equal(json.meshes[json.nodes[4].mesh].primitives[0].extras.openrscad.owner, 2);
 });
 
 test("renderToGlb owns preview semantics while exportShape3D owns export semantics", async () => {

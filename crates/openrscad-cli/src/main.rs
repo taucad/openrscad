@@ -447,6 +447,9 @@ fn run() -> Result<()> {
                     &options,
                 )
                 .context("serializing GLB")?;
+                for warning in &artifact.warnings {
+                    eprintln!("WARNING: {warning}");
+                }
                 std::fs::write(path, artifact.bytes)?;
             }
             "amf" => std::fs::write(path, mesh.to_amf())?,
